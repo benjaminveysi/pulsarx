@@ -1,0 +1,12 @@
+# build outputs
+pulsarx
+pulsarx-ivybridge
+pulsarx-haswell
+metamorphic-gate
+scientific-gate
+metamorphic-gate-ivybridge
+scientific-gate-ivybridge
+metamorphic-gate-haswell
+scientific-gate-haswell
+*.o
+*.perfmap
