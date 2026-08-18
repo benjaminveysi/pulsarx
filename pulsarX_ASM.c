@@ -94,3 +94,122 @@ static inline size_t align64(size_t v)
     return (v + 63) & ~63;
 }
 
+/* ============================================================
+   ARENA ALLOCATOR (NUMA AWARE)
+   ============================================================ */
+
+typedef struct
+{
+    uint8_t *base;
+    size_t size;
+    size_t offset;
+
+} pulsar_arena;
+
+void arena_init(pulsar_arena *a,size_t size,int node)
+{
+    a->size=size;
+    a->offset=0;
+
+    a->base=numa_alloc_onnode(size,node);
+
+    if(!a->base)
+    {
+        perror("arena alloc");
+        exit(1);
+    }
+}
+
+static inline void* arena_alloc(pulsar_arena *a,size_t size)
+{
+    size=align64(size);
+
+    size_t off=__atomic_fetch_add(&a->offset,size,__ATOMIC_RELAXED);
+
+    if(off+size>=a->size)
+        return NULL;
+
+    return a->base+off;
+}
+
+void arena_reset(pulsar_arena *a)
+{
+    a->offset=0;
+}
+
+/* ============================================================
+   SCHEMA
+   ============================================================ */
+
+typedef enum
+{
+    FIELD_I64,
+    FIELD_F64
+
+} field_type;
+
+typedef struct
+{
+    const char *name;
+    field_type type;
+    uint32_t offset;
+
+} field;
+
+typedef struct
+{
+    field fields[PULSAR_MAX_FIELDS];
+
+    uint32_t field_count;
+
+    uint32_t record_size;
+
+} schema;
+
+void schema_init(schema *s)
+{
+    memset(s,0,sizeof(*s));
+}
+
+void schema_add(schema *s,const char*name,field_type t)
+{
+    field *f=&s->fields[s->field_count++];
+
+    f->name=name;
+    f->type=t;
+}
+
+void schema_finalize(schema *s)
+{
+    uint32_t off=0;
+
+    for(uint32_t i=0;i<s->field_count;i++)
+    {
+        s->fields[i].offset=off;
+
+        off+=8;
+    }
+
+    s->record_size=off;
+}
+
+/* ============================================================
+   RECORD
+   ============================================================ */
+
+typedef struct
+{
+    uint8_t *data;
+
+} record;
+
+static inline int64_t rec_get_i64(record *r,uint32_t off)
+{
+    return *(int64_t*)(r->data+off);
+}
+
+static inline void rec_set_i64(record *r,uint32_t off,int64_t v)
+{
+    *(int64_t*)(r->data+off)=v;
+}
+
