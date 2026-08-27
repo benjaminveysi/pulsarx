@@ -213,3 +213,138 @@ static inline void rec_set_i64(record *r,uint32_t off,int64_t v)
     *(int64_t*)(r->data+off)=v;
 }
 
+/* ============================================================
+   LOCK FREE RING BUFFER
+   ============================================================ */
+
+typedef struct
+{
+    record *buffer[PULSAR_RING_SIZE];
+
+    uint64_t head __attribute__((aligned(CACHELINE)));
+    uint64_t tail __attribute__((aligned(CACHELINE)));
+
+} ring;
+
+/* Head/tail are MONOTONIC uint64 counters (never wrapped); the slot index
+   is counter % PULSAR_RING_SIZE. head == tail  =>  empty,
+   head - tail >= PULSAR_RING_SIZE  =>  full. */
+
+void ring_init(ring *r)
+{
+    r->head=0;
+    r->tail=0;
+}
+
+/* Single-producer push (engine_ingest is called from one thread).
+   Returns 0 when the ring is full. */
+int ring_push(ring *r,record *rec)
+{
+    uint64_t head=__atomic_load_n(&r->head,__ATOMIC_RELAXED);
+    uint64_t tail=__atomic_load_n(&r->tail,__ATOMIC_ACQUIRE);
+
+    if(head-tail>=PULSAR_RING_SIZE)
+        return 0;
+
+    r->buffer[head%PULSAR_RING_SIZE]=rec;
+
+    /* Release: publishes the slot write to consumers. */
+    __atomic_store_n(&r->head,head+1,__ATOMIC_RELEASE);
+
+    return 1;
+}
+
+/* Multi-consumer pop: concurrent workers claim disjoint slots via CAS.
+   The slot is read AFTER winning the CAS, so a preempted loser can
+   never return a stale pointer (no ABA). Returns NULL when empty. */
+record* ring_pop(ring *r)
+{
+    uint64_t tail=__atomic_load_n(&r->tail,__ATOMIC_RELAXED);
+
+    for(;;)
+    {
+        /* Acquire: pairs with the producer's release-store of head,
+           making the slot write visible before we read it. */
+        uint64_t head=__atomic_load_n(&r->head,__ATOMIC_ACQUIRE);
+
+        if(tail==head)
+            return NULL;
+
+        uint64_t next=tail+1;
+
+        if(__atomic_compare_exchange_n(&r->tail,&tail,next,0,
+                                      __ATOMIC_ACQ_REL,__ATOMIC_RELAXED))
+        {
+            return r->buffer[tail%PULSAR_RING_SIZE];
+        }
+        /* CAS failed: 'tail' now holds the winner's value; retry. */
+    }
+}
+
+/* ============================================================
+   AoSoA SLABS (§5)
+   ------------------------------------------------------------
+   The record path spends 2 arena_allocs per record (128 bytes for
+   one 8-byte value, 93% waste) and the JIT path gathers 8 pointers
+   into a temp before it can run. A slab packs 8 records' field f
+   into one contiguous 64-byte vector, so the JIT loads it with a
+   single vmovdqa64 and there is no gather and no scatter:
+   field f of the 8 records is at data[f*8 .. f*8+7].
+   ============================================================ */
+
+#define SLAB_LANES 32
+
+typedef struct
+{
+    uint32_t count;     /* records filled in this slab (0..SLAB_LANES) */
+    int64_t  data[];     /* field f, lane l: data[f*SLAB_LANES + l] */
+} __attribute__((aligned(64))) record_slab;
+
+/* Field f's 8-lane vector inside a slab (one zmm load). */
+static inline int64_t *slab_field(record_slab *s, uint32_t field)
+{
+    return &s->data[(size_t)field * SLAB_LANES];
+}
+
+/* Ring of slab pointers (same lock-free discipline as `ring`). */
+typedef struct
+{
+    record_slab *buffer[PULSAR_RING_SIZE];
+
+    uint64_t head __attribute__((aligned(CACHELINE)));
+    uint64_t tail __attribute__((aligned(CACHELINE)));
+
+} slab_ring;
+
+static inline void slab_ring_init(slab_ring *r)
+{
+    r->head = 0;
+    r->tail = 0;
+}
+
+static inline int slab_ring_push(slab_ring *r, record_slab *s)
+{
+    uint64_t head = __atomic_load_n(&r->head, __ATOMIC_RELAXED);
+    uint64_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+    if(head - tail >= PULSAR_RING_SIZE)
+        return 0;
+    r->buffer[head % PULSAR_RING_SIZE] = s;
+    __atomic_store_n(&r->head, head + 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static inline record_slab *slab_ring_pop(slab_ring *r)
+{
+    uint64_t tail = __atomic_load_n(&r->tail, __ATOMIC_RELAXED);
+    for(;;)
+    {
+        uint64_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+        if(tail == head)
+            return NULL;
+        uint64_t next = tail + 1;
+        if(__atomic_compare_exchange_n(&r->tail, &tail, next, 0,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return r->buffer[tail % PULSAR_RING_SIZE];
+    }
+}
+
