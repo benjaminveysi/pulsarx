@@ -348,3 +348,133 @@ static inline record_slab *slab_ring_pop(slab_ring *r)
     }
 }
 
+/* ============================================================
+   EXECUTABLE MEMORY
+   ============================================================ */
+
+typedef struct
+{
+    uint8_t *mem;
+    size_t size;
+    size_t offset;
+
+} jit_mem;
+
+/* §6 MPK forward declarations (defined just below jit_mem_init). */
+static void pulsar_mpk_tag(void *addr, size_t len);
+static void pulsar_mpk_unlock(void);
+static void pulsar_mpk_lock(void);
+
+void jit_mem_init(jit_mem *j,size_t size)
+{
+    j->size=size;
+    j->offset=0;
+
+    j->mem=mmap(NULL,size,
+        PROT_READ|PROT_WRITE|PROT_EXEC,
+        MAP_PRIVATE|MAP_ANONYMOUS,
+        -1,0);
+
+    if(j->mem==MAP_FAILED)
+    {
+        perror("jit mmap");
+        exit(1);
+    }
+
+    /* §6 MPK: tag the JIT pages with the (shared) protection key,
+       when the CPU and kernel support it. The pages stay RWX at the
+       page-table level; the per-thread PKRU register enforces W^X
+       (writable while emitting, exec-only while running). */
+    pulsar_mpk_tag(j->mem, j->size);
+}
+
+/* ============================================================
+   MPK (MEMORY PROTECTION KEYS) — §6
+   ------------------------------------------------------------
+   One pkey for all JIT pages (there are only 16). PKRU is
+   per-thread, so the emitting thread can unlock (writable) while
+   worker threads stay locked (exec-only). This is defense in
+   depth alongside the metamorphic shield, not a hard boundary:
+   any code can WRPKRU, and mprotect is still the real W^X.
+   On hardware without PKU (e.g. Haswell) pkey_alloc fails and
+   everything below is a no-op (plain RWX, as before).
+   ============================================================ */
+
+/* -2 = not yet probed, -1 = unavailable, >= 0 = the pkey. */
+static int g_mpk_pkey = -2;
+
+/* Read the current thread's PKRU (RDPKRU, ECX=0). */
+static inline uint32_t pulsar_rdpkru(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdpkru" : "=a"(lo), "=d"(hi) : "c"(0));
+    return lo;
+}
+
+/* Write the current thread's PKRU (WRPKRU, ECX=0, EDX=0). */
+static inline void pulsar_wrpkru(uint32_t v)
+{
+    __asm__ volatile("wrpkru" : : "a"(v), "c"(0), "d"(0));
+}
+
+/* Lazily allocate the shared JIT pkey. Returns the pkey, or -1. */
+static int pulsar_mpk_pkey(void)
+{
+    if(g_mpk_pkey == -2)
+    {
+        int p = pkey_alloc(0, 0);
+        g_mpk_pkey = p;   /* -1 when the kernel/CPU has no MPK */
+    }
+    return g_mpk_pkey;
+}
+
+/* Tag a JIT mapping with the pkey (no-op without MPK). */
+static void pulsar_mpk_tag(void *addr, size_t len)
+{
+    int p = pulsar_mpk_pkey();
+    if(p < 0) return;
+    /* Keep RWX at the PTE level; PKRU does the W^X enforcement. */
+    pkey_mprotect(addr, len, PROT_READ | PROT_WRITE | PROT_EXEC, p);
+}
+
+/* Make the JIT pages writable for the current thread (clear the
+   write-disable bit for our pkey). Called before emitting code. */
+static void pulsar_mpk_unlock(void)
+{
+    int p = pulsar_mpk_pkey();
+    if(p < 0) return;
+    uint32_t pk = pulsar_rdpkru();
+    pk &= ~(1u << (2 * p + 1));   /* clear write-disable */
+    pulsar_wrpkru(pk);
+}
+
+/* Make the JIT pages exec-only for the current thread (set the
+   write-disable bit for our pkey). Called after installing code,
+   and by pool workers at startup so they can execute but never
+   write the JIT pages. */
+static void pulsar_mpk_lock(void)
+{
+    int p = pulsar_mpk_pkey();
+    if(p < 0) return;
+    uint32_t pk = pulsar_rdpkru();
+    pk |= (1u << (2 * p + 1));    /* set write-disable */
+    pulsar_wrpkru(pk);
+}
+
+static inline void emit8(jit_mem *j,uint8_t v)
+{
+    j->mem[j->offset++]=v;
+}
+
+static inline void emit32(jit_mem *j,uint32_t v)
+{
+    memcpy(j->mem+j->offset,&v,4);
+    j->offset+=4;
+}
+
+static inline void emit64(jit_mem *j,uint64_t v)
+{
+    memcpy(j->mem+j->offset,&v,8);
+    j->offset+=8;
+}
+
