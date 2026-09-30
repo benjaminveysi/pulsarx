@@ -478,3 +478,184 @@ static inline void emit64(jit_mem *j,uint64_t v)
     j->offset+=8;
 }
 
+/* ============================================================
+   METAMORPH RNG
+   ============================================================ */
+
+static inline uint64_t pulsar_rng(uint64_t *s)
+{
+    *s^=*s<<13;
+    *s^=*s>>7;
+    *s^=*s<<17;
+
+    return *s;
+}
+
+/* ============================================================
+   PIPELINE OPS
+   ============================================================ */
+
+typedef enum
+{
+    OP_ADD,
+    OP_SUB,
+    OP_MUL,
+    OP_DIV,
+    OP_SQUARE,
+    /* §5 k-mask ops: OP_CMP_GT sets a per-lane predicate (pred), and
+       the immediately following op executes under it, then pred
+       resets to all-true. OP_SELECT and OP_BIT_XOR are the two ops
+       that most often consume the mask, but ANY op after a CMP_GT
+       is masked. */
+    OP_CMP_GT,
+    OP_SELECT,
+    OP_BIT_XOR
+
+} op_type;
+
+typedef struct
+{
+    op_type type;
+
+    uint32_t field;
+
+    double constant;
+
+} operator;
+
+/* ============================================================
+   PIPELINE
+   ============================================================ */
+
+typedef struct
+{
+    operator ops[PULSAR_MAX_PIPE];
+
+    uint32_t count;
+
+} pipeline;
+
+void pipeline_add(pipeline *p,operator op)
+{
+    p->ops[p->count++]=op;
+}
+
+/* ============================================================
+   ENGINE
+   ============================================================ */
+
+/* JIT function ABI (honest version): every backend emits code that expects
+   RDI = pointer to the record's DATA (r->data), operating on the int64 at
+   [RDI]. The scalar/meta backends process one record; the AVX-512 backend
+   processes 8 packed int64s (64 bytes) at [RDI]. */
+typedef void (*jit_fn_t)(uint8_t *data, uint64_t n);
+
+/* Forward declaration: the free-threaded pool (defined after the
+   executors) lives on the engine so strategies can dispatch to it. */
+typedef struct pulsar_pool pulsar_pool;
+
+typedef struct
+{
+    schema schema;
+
+    pipeline pipe;
+
+    ring queue;
+
+    pulsar_arena arena;
+
+    uint64_t exec_count;
+
+    jit_fn_t jit_fn;
+
+    /* Last compiled code buffer (owned here so recompiles don't leak),
+       plus the vector width the compiled function expects (1 or 8). */
+    jit_mem  jit_code;
+    int      jit_code_valid;
+    int      jit_width;
+
+    /* Non-temporal variant of the 32-wide AVX-512 kernel (v3): same
+       code, but stores with VMOVNTDQ for arrays larger than L3.
+       NULL when the v3 kernel is not in use. */
+    jit_mem  jit_code_nt;
+    int      jit_code_nt_valid;
+    jit_fn_t jit_fn_nt;
+
+    /* Set to 1 to use the NT kernel for large streaming arrays.
+       Default 0: the NT kernel is implemented and verified correct,
+       but it measures SLOWER than the cached v3 kernel on this VM
+       (and on machines with a large L3), so it is opt-in, not the
+       default. Flip it on hardware where streaming stores win. */
+    int      jit_nt_enable;
+
+    /* Persistent thread pool for free-threaded (Python 3.14 style)
+       parallel execution. NULL = serial mode. Created/resized with
+       engine_set_threads(), released with engine_shutdown(). */
+    pulsar_pool *pool;
+
+    /* Streaming worker threads (the ring ingest path). Created with
+       engine_start_workers(), stopped with engine_stop_workers().
+       workers_stop is polled by the workers; set before joining. */
+    pthread_t *worker_threads;
+    int        worker_count;
+    volatile int workers_stop;
+
+    /* §5 AoSoA slab path: slabs being filled and queued. slab_cur is
+       the slab currently being filled (NULL until the first ingest);
+       full slabs go to slab_queue. The JIT runs directly on a slab's
+       field vector (no gather/scatter). */
+    slab_ring   slab_queue;
+    record_slab *slab_cur;
+
+} engine;
+
+void engine_init(engine *e)
+{
+    /* Zero everything first: the pipeline, ring cursors and JIT cache
+       must all start clean (a reused stack slot otherwise accumulates
+       stale ops across init calls). */
+    memset(e,0,sizeof(*e));
+
+    schema_init(&e->schema);
+
+    /* Default schema: one int64 field ("value" at offset 0). The ring
+       ingest path (engine_ingest) allocates record data by
+       schema.record_size -- without a field it would allocate 0 bytes. */
+    schema_add(&e->schema,"value",FIELD_I64);
+    schema_finalize(&e->schema);
+
+    ring_init(&e->queue);
+
+    slab_ring_init(&e->slab_queue);
+    e->slab_cur = NULL;
+
+    arena_init(&e->arena,PULSAR_ARENA_SIZE,0);
+
+    e->exec_count=0;
+
+    e->jit_fn=NULL;
+    e->jit_code_valid=0;
+    e->jit_width=1;
+}
+
+/* Sample pipeline used by the functional test and the benchmark suite:
+   field0 = ((field0 + 10) * 3)^2  — exercises ADD, MUL and SQUARE,
+   i.e. the exact op mix the fusion pass and all JIT backends handle. */
+void engine_load_sample_pipeline(engine *e)
+{
+    operator op;
+    op.field = 0;
+
+    op.type = OP_ADD;
+    op.constant = 10;
+    pipeline_add(&e->pipe, op);
+
+    op.type = OP_MUL;
+    op.constant = 3;
+    pipeline_add(&e->pipe, op);
+
+    op.type = OP_SQUARE;
+    op.constant = 0;
+    pipeline_add(&e->pipe, op);
+}
+
