@@ -659,3 +659,96 @@ void engine_load_sample_pipeline(engine *e)
     pipeline_add(&e->pipe, op);
 }
 
+/* ============================================================
+   INGEST
+   ============================================================ */
+
+void interpret(engine *e, record *r);
+void engine_compile(engine *e);
+
+void engine_ingest(engine *e,int64_t v)
+{
+    record *r=arena_alloc(&e->arena,sizeof(record));
+
+    r->data=arena_alloc(&e->arena,e->schema.record_size);
+
+    rec_set_i64(r,0,v);
+
+    while(!ring_push(&e->queue,r));
+}
+
+/* AoSoA slab ingest (field 0): appends v to the current slab. When the
+   slab fills (SLAB_LANES records) it is pushed to the slab queue and a
+   fresh slab is started. One arena_alloc per slab (not per record).
+   A partial slab is flushed by engine_run_jit_slab (it runs it too). */
+void engine_ingest_slab(engine *e,int64_t v)
+{
+    if(!e->slab_cur)
+    {
+        size_t bytes = sizeof(record_slab) +
+                       (size_t)e->schema.field_count * SLAB_LANES * sizeof(int64_t);
+        e->slab_cur = arena_alloc(&e->arena, bytes);
+        if(!e->slab_cur) return;   /* arena full */
+        e->slab_cur->count = 0;
+    }
+
+    record_slab *s = e->slab_cur;
+    s->data[s->count] = v;   /* field 0, lane = count */
+    s->count++;
+
+    if(s->count >= SLAB_LANES)
+    {
+        while(!slab_ring_push(&e->slab_queue, s));
+        e->slab_cur = NULL;
+    }
+}
+
+/* AoSoA slab run: pops slabs and runs the compiled JIT directly on each
+   slab's field-0 vector (no gather, no scatter; the JIT writes in
+   place). Full slabs from the queue first (older), then the partial
+   current slab (newest). The JIT width must be 32 (v3) for a full
+   slab; any other width, or a partial slab, runs lane by lane
+   through the interpreter. */
+void engine_run_jit_slab(engine *e)
+{
+    engine_compile(e);   /* ensure jit_fn/jit_width are ready */
+
+    record_slab *s;
+    while((s = slab_ring_pop(&e->slab_queue)))
+    {
+        e->exec_count += s->count;
+        if(s->count == SLAB_LANES &&
+           (e->jit_width == 8 || e->jit_width == 16 || e->jit_width == 32))
+        {
+            /* v3 (32) or v4 VEX (16 Haswell / 8 Ivy) kernel, straight
+               on the slab in width-sized chunks — no gather/scatter. */
+            for(uint32_t off = 0; off < SLAB_LANES; off += (uint32_t)e->jit_width)
+                e->jit_fn((uint8_t*)slab_field(s, 0) + off * 8, (uint64_t)e->jit_width);
+        }
+        else
+        {
+            /* Any other width, or a short slab: interpret lane by lane. */
+            for(uint32_t l = 0; l < s->count; l++)
+            {
+                record r;
+                r.data = (uint8_t*)&s->data[l];
+                interpret(e, &r);
+            }
+        }
+    }
+
+    /* Partial current slab (not yet queued). */
+    if(e->slab_cur && e->slab_cur->count > 0)
+    {
+        record_slab *cur = e->slab_cur;
+        e->exec_count += cur->count;
+        for(uint32_t l = 0; l < cur->count; l++)
+        {
+            record r;
+            r.data = (uint8_t*)&cur->data[l];
+            interpret(e, &r);
+        }
+        cur->count = 0;
+    }
+}
+
