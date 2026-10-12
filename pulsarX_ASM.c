@@ -752,3 +752,415 @@ void engine_run_jit_slab(engine *e)
     }
 }
 
+/* ============================================================
+   SIMPLE INTERPRETER
+   ============================================================ */
+
+void interpret(engine *e,record *r)
+{
+    /* §5 predicate mask: -1 = lane active, 0 = lane masked off.
+       OP_CMP_GT sets it; the immediately following op consumes it
+       (executes only where pred is true) and resets it to all-true.
+       With no preceding CMP_GT, pred is all-true so every op applies
+       normally; OP_SELECT with no preceding CMP_GT just sets v = c. */
+    int64_t pred = -1;
+    for(uint32_t i=0;i<e->pipe.count;i++)
+    {
+        operator *op=&e->pipe.ops[i];
+
+        /* uint64_t on purpose: ADD/SUB/MUL wrap mod 2^64, like the
+           hardware does. As signed int64_t this was UB and GCC -O2
+           folded (INT64_MAX + 10) * 3 to 0. DIV/CMP_GT still signed. */
+        uint64_t v=(uint64_t)rec_get_i64(r,e->schema.fields[op->field].offset);
+
+        switch(op->type)
+        {
+            case OP_ADD: if(pred) v+=(uint64_t)(int64_t)op->constant; pred = -1; break;
+            case OP_SUB: if(pred) v-=(uint64_t)(int64_t)op->constant; pred = -1; break;
+            case OP_MUL: if(pred) v*=(uint64_t)(int64_t)op->constant; pred = -1; break;
+            /* Integer division (truncation toward zero), matching every
+               other backend. Divisor 0 or INT64_MIN/-1 traps with SIGFPE,
+               exactly like the JIT's idiv. */
+            case OP_DIV: if(pred) v=(uint64_t)((int64_t)v/(int64_t)op->constant); pred = -1; break;
+            case OP_SQUARE: if(pred) v*=v; pred = -1; break;
+            case OP_CMP_GT: pred = ((int64_t)v > (int64_t)op->constant) ? -1 : 0; break;
+            case OP_SELECT: v = pred ? (uint64_t)(int64_t)op->constant : v; pred = -1; break;
+            case OP_BIT_XOR: if(pred) v ^= (uint64_t)(int64_t)op->constant; pred = -1; break;
+        }
+
+        rec_set_i64(r,e->schema.fields[op->field].offset,(int64_t)v);
+    }
+}
+
+/* ============================================================
+   SIMD CONFIG
+   ============================================================ */
+
+#define SIMD_WIDTH 8
+#define SIMD_PREFETCH 64
+
+/* ============================================================
+   BATCH STRUCTURE
+   ============================================================ */
+
+typedef struct
+{
+    record *items[SIMD_WIDTH];
+
+} record_batch;
+
+/* ============================================================
+   PREFETCH
+   ============================================================ */
+
+static inline void pulsar_prefetch(void *p)
+{
+    _mm_prefetch(p,_MM_HINT_T0);
+}
+
+/* ============================================================
+   LOAD / STORE AVX512
+   ------------------------------------------------------------
+   Only compiles when the toolchain targets AVX-512. Haswell gets
+   the AVX2 variant, Ivy Bridge the SSE4.2 one, and a machine with
+   no SSE4.2 at all falls back to the interpreter for SIMD.
+   ============================================================ */
+
+#ifdef __AVX512F__
+
+static inline __m512i load_i64_batch(record_batch *b,uint32_t off)
+{
+    int64_t tmp[SIMD_WIDTH];
+
+    for(int i=0;i<SIMD_WIDTH;i++)
+        tmp[i]=rec_get_i64(b->items[i],off);
+
+    return _mm512_loadu_si512(tmp);
+}
+
+static inline void store_i64_batch(record_batch *b,uint32_t off,__m512i v)
+{
+    int64_t tmp[SIMD_WIDTH];
+
+    _mm512_storeu_si512(tmp,v);
+
+    for(int i=0;i<SIMD_WIDTH;i++)
+        rec_set_i64(b->items[i],off,tmp[i]);
+}
+
+/* ============================================================
+   SIMD OPERATORS
+   ============================================================ */
+
+static inline __m512i simd_add(__m512i v,int64_t c)
+{
+    __m512i k=_mm512_set1_epi64(c);
+
+    return _mm512_add_epi64(v,k);
+}
+
+static inline __m512i simd_sub(__m512i v,int64_t c)
+{
+    __m512i k=_mm512_set1_epi64(c);
+
+    return _mm512_sub_epi64(v,k);
+}
+
+static inline __m512i simd_mul(__m512i v,int64_t c)
+{
+    __m512i k=_mm512_set1_epi64(c);
+
+    return _mm512_mullo_epi64(v,k);
+}
+
+static inline __m512i simd_square(__m512i v)
+{
+    return _mm512_mullo_epi64(v,v);
+}
+
+/* ============================================================
+   SIMD PIPELINE EXECUTION
+   ============================================================ */
+
+void simd_execute(engine *e,record_batch *b)
+{
+    uint32_t off=e->schema.fields[0].offset;
+
+    __m512i vec=load_i64_batch(b,off);
+    /* §5 predicate mask: 0xFF = all lanes active. CMP_GT sets it;
+       the next op runs under it (merging) and resets it to 0xFF. */
+    __mmask8 pred = 0xFF;
+
+    for(uint32_t i=0;i<e->pipe.count;i++)
+    {
+        operator *op=&e->pipe.ops[i];
+
+        switch(op->type)
+        {
+            case OP_ADD:
+                vec=_mm512_mask_add_epi64(vec, pred, vec,
+                        _mm512_set1_epi64((int64_t)op->constant));
+                pred = 0xFF;
+                break;
+
+            case OP_SUB:
+                vec=_mm512_mask_sub_epi64(vec, pred, vec,
+                        _mm512_set1_epi64((int64_t)op->constant));
+                pred = 0xFF;
+                break;
+
+            case OP_MUL:
+                vec=_mm512_mask_mullo_epi64(vec, pred, vec,
+                        _mm512_set1_epi64((int64_t)op->constant));
+                pred = 0xFF;
+                break;
+
+            case OP_SQUARE:
+                vec=_mm512_mask_mullo_epi64(vec, pred, vec, vec);
+                pred = 0xFF;
+                break;
+
+            case OP_DIV:
+                /* No vector integer divide: spill the in-flight vector,
+                   divide each lane scalar (only where pred is set),
+                   reload. */
+                store_i64_batch(b,off,vec);
+                {
+                    int64_t c = (int64_t)op->constant;
+                    for(int k = 0; k < SIMD_WIDTH; k++)
+                    {
+                        if(!(pred & (1u << k))) continue;
+                        record *r = b->items[k];
+                        int64_t v = rec_get_i64(r,off);
+                        rec_set_i64(r,off,v/c);
+                    }
+                }
+                vec=load_i64_batch(b,off);
+                pred = 0xFF;
+                break;
+
+            case OP_CMP_GT:
+                pred=_mm512_cmpgt_epi64_mask(vec,
+                        _mm512_set1_epi64((int64_t)op->constant));
+                break;
+
+            case OP_SELECT:
+                vec=_mm512_mask_mov_epi64(vec, pred,
+                        _mm512_set1_epi64((int64_t)op->constant));
+                pred = 0xFF;
+                break;
+
+            case OP_BIT_XOR:
+                vec=_mm512_mask_xor_epi64(vec, pred, vec,
+                        _mm512_set1_epi64((int64_t)op->constant));
+                pred = 0xFF;
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    store_i64_batch(b,off,vec);
+}
+
+#elif defined(__AVX2__)
+/* AVX2 (Haswell) SIMD: no 64-bit multiply and no masking — the same
+   VPMULUDQ synthesis as the VEX JIT, and VPBLENDVB for the §5
+   predicate. The 8-lane batch runs as two 4-lane chunks. */
+static inline __m256i simd256_mul64(__m256i x, __m256i c)
+{
+    __m256i xhi = _mm256_srli_epi64(x, 32);
+    __m256i chi = _mm256_srli_epi64(c, 32);
+    __m256i p0 = _mm256_mul_epu32(x, c);    /* xlo*clo */
+    __m256i p1 = _mm256_mul_epu32(x, chi);  /* xlo*chi */
+    __m256i p2 = _mm256_mul_epu32(xhi, c);  /* xhi*clo */
+    __m256i mid = _mm256_add_epi64(p1, p2);
+    mid = _mm256_slli_epi64(mid, 32);
+    return _mm256_add_epi64(p0, mid);
+}
+
+void simd_execute(engine *e,record_batch *b)
+{
+    uint32_t off=e->schema.fields[0].offset;
+
+    for(int chunk = 0; chunk < 2; chunk++)
+    {
+        int64_t tmp[4];
+        for(int k = 0; k < 4; k++)
+            tmp[k] = rec_get_i64(b->items[chunk * 4 + k], off);
+        __m256i vec = _mm256_loadu_si256((__m256i*)tmp);
+        /* §5 predicate as a full vector mask (all-ones = active). */
+        __m256i pred = _mm256_set1_epi64x(-1);
+
+        for(uint32_t i=0;i<e->pipe.count;i++)
+        {
+            operator *op=&e->pipe.ops[i];
+            __m256i cvec;
+            switch(op->type)
+            {
+                case OP_ADD:
+                    cvec = _mm256_set1_epi64x((int64_t)op->constant);
+                    vec = _mm256_blendv_epi8(vec, _mm256_add_epi64(vec, cvec), pred);
+                    pred = _mm256_set1_epi64x(-1);
+                    break;
+                case OP_SUB:
+                    cvec = _mm256_set1_epi64x((int64_t)op->constant);
+                    vec = _mm256_blendv_epi8(vec, _mm256_sub_epi64(vec, cvec), pred);
+                    pred = _mm256_set1_epi64x(-1);
+                    break;
+                case OP_MUL:
+                    cvec = _mm256_set1_epi64x((int64_t)op->constant);
+                    vec = _mm256_blendv_epi8(vec, simd256_mul64(vec, cvec), pred);
+                    pred = _mm256_set1_epi64x(-1);
+                    break;
+                case OP_SQUARE:
+                    vec = _mm256_blendv_epi8(vec, simd256_mul64(vec, vec), pred);
+                    pred = _mm256_set1_epi64x(-1);
+                    break;
+                case OP_DIV: {
+                    /* No vector integer divide: spill, divide scalar
+                       on the active lanes, reload. */
+                    int64_t c = (int64_t)op->constant;
+                    _mm256_storeu_si256((__m256i*)tmp, vec);
+                    int64_t pm[4];
+                    _mm256_storeu_si256((__m256i*)pm, pred);
+                    for(int k = 0; k < 4; k++)
+                    {
+                        if(!pm[k]) continue;
+                        tmp[k] /= c;
+                    }
+                    vec = _mm256_loadu_si256((__m256i*)tmp);
+                    pred = _mm256_set1_epi64x(-1);
+                    break;
+                }
+                case OP_CMP_GT:
+                    pred = _mm256_cmpgt_epi64(vec,
+                            _mm256_set1_epi64x((int64_t)op->constant));
+                    break;
+                case OP_SELECT:
+                    vec = _mm256_blendv_epi8(vec,
+                            _mm256_set1_epi64x((int64_t)op->constant), pred);
+                    pred = _mm256_set1_epi64x(-1);
+                    break;
+                case OP_BIT_XOR:
+                    cvec = _mm256_set1_epi64x((int64_t)op->constant);
+                    vec = _mm256_blendv_epi8(vec, _mm256_xor_si256(vec, cvec), pred);
+                    pred = _mm256_set1_epi64x(-1);
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        _mm256_storeu_si256((__m256i*)tmp, vec);
+        for(int k = 0; k < 4; k++)
+            rec_set_i64(b->items[chunk * 4 + k], off, tmp[k]);
+    }
+}
+
+#elif defined(__SSE4_2__)
+/* SSE4.2: real 2-lane vector executor, not the interpreter.
+   Same VPMULUDQ synthesis as the VEX JIT, at 128 bit; the
+   8-lane batch runs as four 2-lane chunks. */
+static inline __m128i simd128_mul64(__m128i x, __m128i c)
+{
+    __m128i xhi = _mm_srli_epi64(x, 32);
+    __m128i chi = _mm_srli_epi64(c, 32);
+    __m128i p0 = _mm_mul_epu32(x, c);    /* xlo*clo */
+    __m128i p1 = _mm_mul_epu32(x, chi);  /* xlo*chi */
+    __m128i p2 = _mm_mul_epu32(xhi, c);  /* xhi*clo */
+    __m128i mid = _mm_add_epi64(p1, p2);
+    mid = _mm_slli_epi64(mid, 32);
+    return _mm_add_epi64(p0, mid);
+}
+
+void simd_execute(engine *e,record_batch *b)
+{
+    uint32_t off=e->schema.fields[0].offset;
+
+    for(int chunk = 0; chunk < 4; chunk++)
+    {
+        int64_t tmp[2];
+        for(int k = 0; k < 2; k++)
+            tmp[k] = rec_get_i64(b->items[chunk * 2 + k], off);
+        __m128i vec = _mm_loadu_si128((__m128i*)tmp);
+        /* §5 predicate as a full vector mask (all-ones = active). */
+        __m128i pred = _mm_set1_epi64x(-1);
+
+        for(uint32_t i=0;i<e->pipe.count;i++)
+        {
+            operator *op=&e->pipe.ops[i];
+            __m128i cvec;
+            switch(op->type)
+            {
+                case OP_ADD:
+                    cvec = _mm_set1_epi64x((int64_t)op->constant);
+                    vec = _mm_blendv_epi8(vec, _mm_add_epi64(vec, cvec), pred);
+                    pred = _mm_set1_epi64x(-1);
+                    break;
+                case OP_SUB:
+                    cvec = _mm_set1_epi64x((int64_t)op->constant);
+                    vec = _mm_blendv_epi8(vec, _mm_sub_epi64(vec, cvec), pred);
+                    pred = _mm_set1_epi64x(-1);
+                    break;
+                case OP_MUL:
+                    cvec = _mm_set1_epi64x((int64_t)op->constant);
+                    vec = _mm_blendv_epi8(vec, simd128_mul64(vec, cvec), pred);
+                    pred = _mm_set1_epi64x(-1);
+                    break;
+                case OP_SQUARE:
+                    vec = _mm_blendv_epi8(vec, simd128_mul64(vec, vec), pred);
+                    pred = _mm_set1_epi64x(-1);
+                    break;
+                case OP_DIV: {
+                    /* No vector integer divide: spill, divide scalar
+                       on the active lanes, reload. */
+                    int64_t c = (int64_t)op->constant;
+                    _mm_storeu_si128((__m128i*)tmp, vec);
+                    int64_t pm[2];
+                    _mm_storeu_si128((__m128i*)pm, pred);
+                    for(int k = 0; k < 2; k++)
+                    {
+                        if(!pm[k]) continue;
+                        tmp[k] /= c;
+                    }
+                    vec = _mm_loadu_si128((__m128i*)tmp);
+                    pred = _mm_set1_epi64x(-1);
+                    break;
+                }
+                case OP_CMP_GT:
+                    pred = _mm_cmpgt_epi64(vec,
+                            _mm_set1_epi64x((int64_t)op->constant));
+                    break;
+                case OP_SELECT:
+                    vec = _mm_blendv_epi8(vec,
+                            _mm_set1_epi64x((int64_t)op->constant), pred);
+                    pred = _mm_set1_epi64x(-1);
+                    break;
+                case OP_BIT_XOR:
+                    cvec = _mm_set1_epi64x((int64_t)op->constant);
+                    vec = _mm_blendv_epi8(vec, _mm_xor_si128(vec, cvec), pred);
+                    pred = _mm_set1_epi64x(-1);
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        _mm_storeu_si128((__m128i*)tmp, vec);
+        for(int k = 0; k < 2; k++)
+            rec_set_i64(b->items[chunk * 2 + k], off, tmp[k]);
+    }
+}
+
+#else
+/* No AVX-512, AVX2 or SSE4.2: SIMD just runs the interpreter
+   per record. Same results, no illegal instruction. */
+void simd_execute(engine *e,record_batch *b)
+{
+    for(int i = 0; i < SIMD_WIDTH; i++)
+        interpret(e, b->items[i]);
+}
+#endif
+
