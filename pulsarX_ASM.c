@@ -1164,3 +1164,136 @@ void simd_execute(engine *e,record_batch *b)
 }
 #endif
 
+/* ============================================================
+   BATCH BUILDER
+   ============================================================ */
+
+int build_batch(engine *e,record_batch *b)
+{
+    int n=0;
+
+    for(int i=0;i<SIMD_WIDTH;i++)
+    {
+        record *r=ring_pop(&e->queue);
+
+        if(!r)
+            break;
+
+        pulsar_prefetch(r->data);
+
+        b->items[i]=r;
+
+        n++;
+    }
+
+    return n;
+}
+
+/* ============================================================
+   SIMD RUN LOOP
+   ============================================================ */
+
+void engine_run_simd(engine *e)
+{
+    record_batch batch;
+
+    while(1)
+    {
+        int n=build_batch(e,&batch);
+
+        if(n==0)
+            break;
+
+        if(n==SIMD_WIDTH)
+        {
+            simd_execute(e,&batch);
+        }
+        else
+        {
+            for(int i=0;i<n;i++)
+                interpret(e,batch.items[i]);
+        }
+
+        /* Atomic: several streaming workers may drain concurrently. */
+        __atomic_fetch_add(&e->exec_count,(uint64_t)n,__ATOMIC_RELAXED);
+    }
+}
+
+/* ============================================================
+   WORKER THREAD (SIMD MODE)
+   ============================================================ */
+
+typedef struct
+{
+    engine *eng;
+    int cpu;
+
+} worker;
+
+void* worker_simd(void *arg)
+{
+    worker *w=arg;
+
+    cpu_set_t set;
+
+    CPU_ZERO(&set);
+    CPU_SET(w->cpu,&set);
+
+    sched_setaffinity(0,sizeof(set),&set);
+
+    /* Drain until asked to stop. Between drains the ring is empty and
+       engine_run_simd returns immediately (hot spin, by design). */
+    while(!w->eng->workers_stop)
+    {
+        engine_run_simd(w->eng);
+    }
+
+    free(w);
+    return NULL;
+}
+
+/* ============================================================
+   SPAWN / STOP WORKERS
+   ============================================================ */
+
+void engine_stop_workers(engine *e)
+{
+    if(!e->worker_threads)
+        return;
+
+    e->workers_stop = 1;
+
+    for(int i = 0; i < e->worker_count; i++)
+        pthread_join(e->worker_threads[i], NULL);
+
+    free(e->worker_threads);
+    e->worker_threads = NULL;
+    e->worker_count = 0;
+    e->workers_stop = 0;
+}
+
+void engine_start_workers(engine *e,int n)
+{
+    /* Restart cleanly if workers are already running. */
+    engine_stop_workers(e);
+
+    if(n > PULSAR_WORKERS)
+        n = PULSAR_WORKERS;
+    if(n <= 0)
+        return;
+
+    e->worker_threads = malloc((size_t)n * sizeof(pthread_t));
+    e->worker_count = n;
+    e->workers_stop = 0;
+
+    for(int i=0;i<n;i++)
+    {
+        worker *w=malloc(sizeof(worker));
+
+        w->eng=e;
+        w->cpu=i;
+
+        pthread_create(&e->worker_threads[i],NULL,worker_simd,w);
+    }
+}
+
