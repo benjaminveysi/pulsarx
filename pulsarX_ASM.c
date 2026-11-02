@@ -1670,3 +1670,400 @@ static void emit_magic_div_r64_const(jit_builder *jb, uint8_t working_reg, int64
         emit_mov_r64(jb, working_reg, 0 /*RAX*/);
 }
 
+/* ============================================================
+   EVEX prefix construction (verified against gas/objdump/gcc)
+   ------------------------------------------------------------
+   P0 = (~D[3]<<7) | (~S2[4]<<6) | (~S2[3]<<5) | (~D[4]<<4) | mm
+        mm: 01 = 0F map, 10 = 0F38 map
+   P1 = (W<<7) | ((~S1 & 0xF)<<3) | 0x04 | pp
+        pp: 01 = 66 prefix, 10 = F3 prefix
+   P2 = 0x40 | (S1[4] ? 0 : 0x08) | mask
+        (0x48 = 512-bit, merging, k0; bit3 = ~S1[4] (V'))
+   One verified quirk: VPMULUDQ (0F38, opcode F4) is encoded with
+   mm=01, not 10 -- confirmed by gas, objdump and gcc intrinsics.
+   ------------------------------------------------------------ */
+
+/* D = ModRM.reg operand, S1 = vvvv operand, S2 = ModRM.rm operand. */
+static inline void emit_evex(jit_builder *jb, uint8_t mm, uint8_t w, uint8_t pp,
+                             uint8_t dst, uint8_t src1, uint8_t src2, uint8_t mask)
+{
+    uint8_t p0 = (uint8_t)(((dst & 8) ? 0 : 0x80) | ((src2 & 16) ? 0 : 0x40) |
+                          ((src2 & 8) ? 0 : 0x20) | ((dst & 16) ? 0 : 0x10) | mm);
+    uint8_t p1 = (uint8_t)((w ? 0x80 : 0) | (((~src1) & 0xF) << 3) | 0x04 | pp);
+    uint8_t p2 = (uint8_t)(0x40 | ((src1 & 16) ? 0 : 0x08) | (mask & 7));
+    jb_emit8(jb, 0x62);
+    jb_emit8(jb, p0);
+    jb_emit8(jb, p1);
+    jb_emit8(jb, p2);
+}
+
+/* 3-operand vector ALU op: dst = op(src1, src2). mm: 1 = 0F, 2 = 0F38.
+   mask: 0 = k0 (unmasked), else the k register (1..7). */
+static inline void emit_evex_3(jit_builder *jb, uint8_t mm, uint8_t opcode,
+                               uint8_t dst, uint8_t src1, uint8_t src2, uint8_t mask)
+{
+    emit_evex(jb, mm, 1 /*W*/, 1 /*66*/, dst, src1, src2, mask);
+    jb_emit8(jb, opcode);
+    emit_modrm(jb, 3, dst, src2);
+}
+
+static inline void emit_vpaddq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t mask){
+    emit_evex_3(jb, 1, 0xD4, dst, s1, s2, mask);
+}
+static inline void emit_vpsubq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t mask){
+    emit_evex_3(jb, 1, 0xFB, dst, s1, s2, mask);
+}
+static inline void emit_vpmullq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t mask){
+    emit_evex_3(jb, 2, 0x40, dst, s1, s2, mask);
+}
+static inline void emit_vpxorq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t mask){
+    emit_evex_3(jb, 1, 0xEF, dst, s1, s2, mask);
+}
+static inline void emit_vpandq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t mask){
+    emit_evex_3(jb, 1, 0xDB, dst, s1, s2, mask);
+}
+static inline void emit_vporq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t mask){
+    emit_evex_3(jb, 1, 0xEB, dst, s1, s2, mask);
+}
+/* VPMULUDQ: 32-bit unsigned multiply, full 64-bit product of the low
+   32 bits of each lane. Encoded with mm=01 (verified quirk). */
+static inline void emit_vpmuludq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2){
+    emit_evex_3(jb, 1, 0xF4, dst, s1, s2, 0);
+}
+
+/* Vector shift by an immediate: VPSRLQ (0x73 /2), VPSRAQ (0x72 /4),
+   VPSLLQ (0x72 /6). Unlike the 3-operand ALU ops, the shift's
+   DESTINATION is encoded in vvvv and the SOURCE in ModRM.rm
+   (verified against gas: `vpsraq $63, %zmm0, %zmm1` ->
+   62 F1 F5 48 72 E0 3F). The reg field holds the sub-opcode. */
+static inline void emit_evex_shift_imm(jit_builder *jb, uint8_t opcode, uint8_t sub,
+                                       uint8_t dst, uint8_t src, uint8_t imm)
+{
+    emit_evex(jb, 1, 1, 1, sub, dst, src, 0);
+    jb_emit8(jb, opcode);
+    emit_modrm(jb, 3, sub, src);
+    jb_emit8(jb, imm);
+}
+
+static inline void emit_vpsrlq(jit_builder *jb, uint8_t dst, uint8_t src, uint8_t imm){
+    emit_evex_shift_imm(jb, 0x73, 2, dst, src, imm);
+}
+static inline void emit_vpsraq(jit_builder *jb, uint8_t dst, uint8_t src, uint8_t imm){
+    emit_evex_shift_imm(jb, 0x72, 4, dst, src, imm);
+}
+static inline void emit_vpsllq(jit_builder *jb, uint8_t dst, uint8_t src, uint8_t imm){
+    /* VPSLLQ is opcode 0x73 /6 (0x72 is VPSRAQ's opcode, /4 only). */
+    emit_evex_shift_imm(jb, 0x73, 6, dst, src, imm);
+}
+
+/* VMOVDQA64 zmmD, zmmS (register-to-register copy). */
+static inline void emit_vmovdqa64_rr(jit_builder *jb, uint8_t dst, uint8_t src){
+    emit_evex(jb, 1, 1, 1, dst, 0, src, 0);
+    jb_emit8(jb, 0x6F);
+    emit_modrm(jb, 3, dst, src);
+}
+
+/* Masked register-to-register move (merging): dst = k ? src : dst.
+   Used for OP_SELECT (v = pred ? c : v) and to blend a DIV result
+   back under the predicate. mask is a k register 1..7 (0 = unmasked). */
+static inline void emit_vmovdqa64_rr_masked(jit_builder *jb, uint8_t dst, uint8_t src,
+                                            uint8_t mask){
+    emit_evex(jb, 1, 1, 1, dst, 0, src, mask);
+    jb_emit8(jb, 0x6F);
+    emit_modrm(jb, 3, dst, src);
+}
+
+/* VPBROADCASTQ zmmD, r64 (GPR source). */
+static inline void emit_vpbroadcastq(jit_builder *jb, uint8_t dst, uint8_t gpr){
+    emit_evex(jb, 2, 1, 1, dst, 0, gpr, 0);
+    jb_emit8(jb, 0x7C);
+    emit_modrm(jb, 3, dst, gpr);
+}
+
+/* VPCMPGTQ kD, zmmS1, zmmS2 (signed greater-than, result in a k mask). */
+static inline void emit_vpcmpgtq(jit_builder *jb, uint8_t k, uint8_t s1, uint8_t s2){
+    emit_evex(jb, 2, 1, 1, k, s1, s2, 0);
+    jb_emit8(jb, 0x37);
+    emit_modrm(jb, 3, k, s2);
+}
+
+/* Load/store through [RDI]. opcode 0x6F = load, 0x7F = store.
+   pp: 1 = 66 (aligned, VMOVDQA64), 2 = F3 (unaligned, VMOVDQU64).
+   w: 1 normally; 0 for VMOVNTDQ (opcode 0xE7, store-only). */
+static inline void emit_evex_mem(jit_builder *jb, uint8_t opcode, uint8_t pp, uint8_t w,
+                                 uint8_t zmm)
+{
+    emit_evex(jb, 1, w, pp, zmm, 0, 7 /*RDI*/, 0);
+    jb_emit8(jb, opcode);
+    emit_modrm(jb, 0, zmm, 7);
+}
+
+/* Same, but through [RDI + disp]. disp==0 uses mod 0; otherwise
+   mod 2 + disp32 (covers the 64/128/192-byte vector strides of
+   the 4x-unrolled kernel). */
+static inline void emit_evex_mem_disp(jit_builder *jb, uint8_t opcode, uint8_t pp,
+                                      uint8_t w, uint8_t zmm, int32_t disp)
+{
+    emit_evex(jb, 1, w, pp, zmm, 0, 7 /*RDI*/, 0);
+    jb_emit8(jb, opcode);
+    if(disp == 0)
+        emit_modrm(jb, 0, zmm, 7);
+    else
+    {
+        emit_modrm(jb, 2, zmm, 7);
+        jb_emit32(jb, (uint32_t)disp);
+    }
+}
+
+/* ------------------------------------------------------------
+   Vector Granlund-Montgomery division (one 512-bit accumulator)
+   ------------------------------------------------------------
+   acc: the accumulator zmm (8 signed int64 lanes) -- overwritten
+        with the quotients.
+   d:   the constant divisor (d != 0, d != +-1; those keep idiv).
+   T:   10 scratch zmm registers (must not alias acc or C).
+   C:   6 constant zmm registers, already broadcast:
+        C[0] = M & 0xFFFFFFFF (Mlo), C[1] = M >> 32 (Mhi),
+        C[2] = 0xFFFFFFFF, C[3] = 2^32, C[4] = 0x8000... (sign bit),
+        C[5] = all-ones (used to flip the sign mask when d < 0).
+   The 64-bit mulhi is built from 32-bit VPMULUDQ (verified offline).
+   Power-of-two divisors use the shift path (emit_evex_pow2_div).
+   ------------------------------------------------------------ */
+
+static void emit_evex_magic_div(jit_builder *jb, uint8_t acc, int64_t d,
+                                const uint8_t *T, const uint8_t *C)
+{
+    div_magic dm;
+    if(!compute_magic_i64(d, &dm))
+        return;   /* caller falls back to the spill/idiv path */
+
+    uint8_t sign = T[0], a_hi = T[1], t1 = T[2], t2 = T[3], t3 = T[4];
+    uint8_t t4 = T[5], S = T[6], hi = T[7], u = T[8], w = T[9];
+    uint8_t Mlo = C[0], Mhi = C[1], FFFF = C[2], TWO32 = C[3];
+    uint8_t SIGNBIT = C[4], ONES = C[5];
+
+    /* 1. sign mask, then |x| in place in acc */
+    emit_vpsraq(jb, sign, acc, 63);             /* sign = acc >> 63 */
+    emit_vpxorq(jb, acc, acc, sign, 0);            /* acc ^= sign */
+    emit_vpsubq(jb, acc, acc, sign, 0);            /* acc -= sign  -> |x| */
+
+    /* 2. 64-bit unsigned mulhi(M, |x|) from 32-bit VPMULUDQ.
+          a = a_lo + 2^32*a_hi, M = M_lo + 2^32*M_hi
+          product = t1 + 2^32*(t2+t3) + 2^64*t4
+          hi = t4 + S_hi + c2 + 2^32*c
+          (S_hi = (t2+t3)>>32, c = unsigned-overflow of t2+t3,
+           c2 = ((t1>>32) + (S & 0xFFFFFFFF)) >> 32) */
+    emit_vpsrlq(jb, a_hi, acc, 32);
+    emit_vpmuludq(jb, t1, acc, Mlo);            /* a_lo * M_lo */
+    emit_vpmuludq(jb, t2, acc, Mhi);            /* a_lo * M_hi */
+    emit_vpmuludq(jb, t3, a_hi, Mlo);           /* a_hi * M_lo */
+    emit_vpmuludq(jb, t4, a_hi, Mhi);           /* a_hi * M_hi */
+    emit_vpaddq(jb, S, t2, t3, 0);              /* S = t2 + t3 (may wrap) */
+    emit_vpsrlq(jb, hi, S, 32);                 /* hi = S >> 32 (S_hi; must
+                                                   come before the XORs below,
+                                                   which flip S's top bit) */
+    /* unsigned overflow of t2+t3: flip the sign bit of both, signed cmp.
+       Uses k7 (not k1): k1..k4 hold the §5 per-vector predicate masks,
+       and a magic DIV must not clobber them. */
+    emit_vpxorq(jb, t2, t2, SIGNBIT, 0);
+    emit_vpxorq(jb, S, S, SIGNBIT, 0);
+    emit_vpcmpgtq(jb, 7 /*k7*/, t2, S);         /* k7 = (t2 > S) unsigned */
+    emit_vpsrlq(jb, u, t1, 32);                 /* u = t1 >> 32 */
+    emit_vpandq(jb, w, S, FFFF, 0);                /* w = S & 0xFFFFFFFF (low 32
+                                                   bits are untouched by the
+                                                   sign-bit XOR) */
+    emit_vpaddq(jb, w, u, w, 0);                /* w = u + w */
+    emit_vpsrlq(jb, w, w, 32);                  /* w = c2 */
+    /* hi = t4 + S_hi + c2 + (k7 ? 2^32 : 0) */
+    emit_vpaddq(jb, hi, t4, hi, 0);             /* hi = t4 + S_hi */
+    emit_vpaddq(jb, hi, hi, w, 0);              /* hi += c2 */
+    emit_vpaddq(jb, hi, hi, TWO32, 7);          /* hi += 2^32 if k7 */
+
+    /* 3. qabs = hi >> shift */
+    emit_vpsrlq(jb, hi, hi, (uint8_t)dm.shift);
+
+    /* 4. sign fix: q = (sign==-1) ? -qabs : qabs (flipped when d < 0) */
+    if(d < 0)
+        emit_vpxorq(jb, sign, sign, ONES, 0);      /* flip the mask */
+    emit_vpxorq(jb, hi, hi, sign, 0);
+    emit_vpsubq(jb, hi, hi, sign, 0);
+    emit_vmovdqa64_rr(jb, acc, hi);             /* acc = quotient */
+}
+
+/* Vector power-of-two division: acc /= +-2^k (signed, trunc toward
+   zero). tmp is one scratch zmm (must not alias acc). */
+static void emit_evex_pow2_div(jit_builder *jb, uint8_t acc, int k, int neg, uint8_t tmp)
+{
+    /* bias = (acc>>63) >>_logical (64-k)  ==  0 or 2^k-1 */
+    emit_vpsraq(jb, tmp, acc, 63);
+    emit_vpsrlq(jb, tmp, tmp, (uint8_t)(64 - k));
+    emit_vpaddq(jb, acc, acc, tmp, 0);
+    emit_vpsraq(jb, acc, acc, (uint8_t)k);
+    if(neg)
+    {
+        uint8_t zero = tmp;
+        emit_vpxorq(jb, zero, zero, zero, 0);      /* zero = 0 */
+        emit_vpsubq(jb, acc, zero, acc, 0);        /* acc = -acc */
+    }
+}
+
+/* ------------------------------------------------------------
+   Emit ADD r/m64, imm8
+   (opcode: 0x83 /0 ib)
+   ------------------------------------------------------------ */
+
+static inline void emit_add_r64_imm8(jit_builder *jb, uint8_t rm, int8_t imm){
+    emit_rex64(jb, 0, rm);
+    jb_emit8(jb, 0x83);
+    emit_modrm(jb, 3, 0, rm);
+    jb_emit8(jb, imm);
+}
+
+/* ------------------------------------------------------------
+   Emit IMUL r/m64, imm8
+   (opcode: 0x6B /r)
+   ------------------------------------------------------------ */
+
+static inline void emit_imul_r64_imm8(jit_builder *jb, uint8_t reg, uint8_t rm, int8_t imm){
+    emit_rex64(jb, reg, rm);
+    jb_emit8(jb, 0x6B);
+    emit_modrm(jb, 3, reg, rm);
+    jb_emit8(jb, imm);
+}
+
+/* ------------------------------------------------------------
+   Emit SQARE: IMUL reg, reg
+   (0x0F AF /r)
+   ------------------------------------------------------------ */
+
+static inline void emit_imul_self(jit_builder *jb, uint8_t reg){
+    emit_rex64(jb, reg, reg);
+    jb_emit8(jb, 0x0F);
+    jb_emit8(jb, 0xAF);
+    emit_modrm(jb, 3, reg, reg);
+}
+
+/* ------------------------------------------------------------
+   Emit ADD r/m64, imm32   (0x81 /0 id)
+   Emit SUB r/m64, imm32   (0x81 /5 id)
+   Emit IMUL r64, r/m64, imm32 (0x69 /r id)
+   Full-range ALU op on RAX by a 64-bit constant:
+   imm32 form when it fits, otherwise movabs RCX + reg op.
+   (The old imm8-only forms silently truncated |c| > 127.)
+   ------------------------------------------------------------ */
+
+static inline void emit_add_r64_imm32(jit_builder *jb, uint8_t rm, int32_t imm){
+    emit_rex64(jb, 0, rm);
+    jb_emit8(jb, 0x81);
+    emit_modrm(jb, 3, 0, rm);
+    jb_emit32(jb, (uint32_t)imm);
+}
+
+static inline void emit_sub_r64_imm32(jit_builder *jb, uint8_t rm, int32_t imm){
+    emit_rex64(jb, 0, rm);
+    jb_emit8(jb, 0x81);
+    emit_modrm(jb, 3, 5, rm);
+    jb_emit32(jb, (uint32_t)imm);
+}
+
+static inline void emit_imul_r64_imm32(jit_builder *jb, uint8_t reg, uint8_t rm, int32_t imm){
+    emit_rex64(jb, reg, rm);
+    jb_emit8(jb, 0x69);
+    emit_modrm(jb, 3, reg, rm);
+    jb_emit32(jb, (uint32_t)imm);
+}
+
+/* alu: 0 = reg += c, 1 = reg -= c, 2 = reg *= c. Correct for all int64 c.
+   The scratch register is picked to never alias the working reg. */
+static void emit_alu_r64_const(jit_builder *jb, int alu, uint8_t reg, int64_t c){
+    if(c >= INT32_MIN && c <= INT32_MAX){
+        int32_t i = (int32_t)c;
+        if(alu == 0)      emit_add_r64_imm32(jb, reg, i);
+        else if(alu == 1) emit_sub_r64_imm32(jb, reg, i);
+        else              emit_imul_r64_imm32(jb, reg, reg, i);
+        return;
+    }
+    uint8_t scratch = (reg == 1) ? 2 : 1;   /* RCX unless reg IS RCX */
+    emit_mov_imm64(jb, scratch, (uint64_t)c);
+    emit_rex64(jb, reg, scratch);
+    if(alu == 0){                             /* ADD reg, scratch */
+        jb_emit8(jb, 0x01);
+        emit_modrm(jb, 3, scratch, reg);
+    } else if(alu == 1){                      /* SUB reg, scratch */
+        jb_emit8(jb, 0x29);
+        emit_modrm(jb, 3, scratch, reg);
+    } else {                                  /* IMUL reg, scratch */
+        jb_emit8(jb, 0x0F);
+        jb_emit8(jb, 0xAF);
+        emit_modrm(jb, 3, reg, scratch);
+    }
+}
+
+/* ------------------------------------------------------------
+   Return
+   ------------------------------------------------------------ */
+
+static inline void emit_ret(jit_builder *jb){
+    jb_emit8(jb, 0xC3);
+}
+
+/* Take ownership of a finished jit_builder's code buffer: publish the entry
+   point, remember the vector width the emitted code expects, and release
+   any previously compiled buffer so recompiles don't leak. */
+/* Append one line to the perf map (/tmp/perf-<pid>.map) so `perf`
+   can name JIT functions in profiles and flamegraphs.
+   Format: <address> <size> <symbol>. Best-effort: silently ignored
+   when the file cannot be opened. */
+static void pulsar_perf_map_add(const char *sym, const void *addr, size_t size)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/perf-%d.map", (int)getpid());
+    FILE *f = fopen(path, "a");
+    if(!f) return;
+    fprintf(f, "%lx %zx %s\n", (unsigned long)(uintptr_t)addr, size, sym);
+    fclose(f);
+}
+
+static void jit_code_install(engine *e, jit_builder *jb, int width, const char *sym)
+{
+    if(e->jit_code_valid)
+        munmap(e->jit_code.mem, e->jit_code.size);
+
+    e->jit_code       = jb->mem;
+    e->jit_code_valid = 1;
+    e->jit_width      = width;
+    e->jit_fn         = (jit_fn_t)jb->mem.mem;
+
+    /* §6 MPK: exec-only for this thread now that the code is in. */
+    pulsar_mpk_lock();
+    /* §6 perf map: name this JIT function for `perf`. */
+    pulsar_perf_map_add(sym, jb->mem.mem, jb->mem.offset);
+}
+
+/* Install the non-temporal (VMOVNTDQ) variant of the 32-wide kernel.
+   It shares the same width (32) as the main v3 kernel; only the
+   entry point differs, so jit_width/jit_fn are left alone. */
+static void jit_code_install_nt(engine *e, jit_builder *jb)
+{
+    if(e->jit_code_nt_valid)
+        munmap(e->jit_code_nt.mem, e->jit_code_nt.size);
+
+    e->jit_code_nt       = jb->mem;
+    e->jit_code_nt_valid = 1;
+    e->jit_fn_nt         = (jit_fn_t)jb->mem.mem;
+
+    /* §6 MPK: exec-only for this thread now that the code is in. */
+    pulsar_mpk_lock();
+    pulsar_perf_map_add("pxasm_jit_nt", jb->mem.mem, jb->mem.offset);
+}
+
+static void jit_code_nt_free(engine *e)
+{
+    if(e->jit_code_nt_valid)
+    {
+        munmap(e->jit_code_nt.mem, e->jit_code_nt.size);
+        e->jit_code_nt_valid = 0;
+        e->jit_fn_nt = NULL;
+    }
+}
+
