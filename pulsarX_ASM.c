@@ -2067,3 +2067,253 @@ static void jit_code_nt_free(engine *e)
     }
 }
 
+/* ============================================================
+   JIT Generator for integer pipelines (scalar baseline)
+   ============================================================ */
+
+void jit_compile_scalar(engine *e)
+{
+    jit_builder jb;
+    jb_init(&jb, 65536);
+
+    /*
+     * Signature:
+     * void fn(record *r, uint64_t n)
+     *
+     * we assume r->data in RDI
+     * execute pipeline ops sequentially on [RDI]
+     */
+
+    // MOV RAX, [RDI]
+    emit_rex64(&jb, 0, 7);     // RDI in rm=7
+    jb_emit8(&jb, 0x8B);       // MOV r64,r/m64
+    emit_modrm(&jb, 0, 0, 7);  // RAX ← [RDI]
+    // Now RAX holds the field value
+    // §5 predicate in RSI: -1 = active, 0 = masked off (all-true initially)
+    emit_mov_imm64(&jb, 6 /*RSI*/, (uint64_t)-1);
+
+    /* §5 mask state: set by OP_CMP_GT; the next op is skipped entirely
+       (TEST RSI,RSI; JZ) when pred is 0, then pred resets to all-true. */
+    int mask_pending = 0;
+    for (uint32_t i = 0; i < e->pipe.count; ++i) {
+        operator *op = &e->pipe.ops[i];
+        if(op->type == OP_CMP_GT)
+        {
+            /* pred = (RAX > c) ? -1 : 0. Overwrites any pending mask. */
+            emit_cmp_r64_const(&jb, 0 /*RAX*/, (int64_t)op->constant);
+            emit_mov_imm64(&jb, 6 /*RSI*/, 0);
+            emit_mov_imm64(&jb, 1 /*RCX*/, (uint64_t)-1);
+            emit_cmovg_r64(&jb, 6 /*RSI*/, 1 /*RCX*/);
+            mask_pending = 1;
+            continue;
+        }
+        size_t jz_pos = 0;
+        if(mask_pending)
+            jz_pos = emit_test_pred_jz(&jb);
+        switch (op->type) {
+            case OP_ADD:
+                emit_alu_r64_const(&jb, 0 /*add*/, 0 /*RAX*/, (int64_t)op->constant);
+                break;
+            case OP_SUB:
+                emit_alu_r64_const(&jb, 1 /*sub*/, 0 /*RAX*/, (int64_t)op->constant);
+                break;
+            case OP_MUL:
+                emit_alu_r64_const(&jb, 2 /*mul*/, 0 /*RAX*/, (int64_t)op->constant);
+                break;
+            case OP_SQUARE:
+                emit_imul_self(&jb, 0 /*RAX*/);
+                break;
+            case OP_DIV:
+                emit_magic_div_r64_const(&jb, 0 /*RAX*/, (int64_t)op->constant);
+                break;
+            case OP_SELECT:
+                /* Inside the guard pred != 0 (or all-true with no mask),
+                   so RAX = c unconditionally. */
+                emit_mov_imm64(&jb, 0 /*RAX*/, (uint64_t)(int64_t)op->constant);
+                break;
+            case OP_BIT_XOR:
+                emit_xor_r64_const(&jb, 0 /*RAX*/, (int64_t)op->constant);
+                break;
+            default:
+                break;
+        }
+        if(mask_pending)
+        {
+            patch_jz_rel32(&jb, jz_pos);
+            emit_mov_imm64(&jb, 6 /*RSI*/, (uint64_t)-1);   /* pred = all-true */
+            mask_pending = 0;
+        }
+    }
+
+    // MOV [RDI], RAX
+    emit_rex64(&jb, 0, 7);
+    jb_emit8(&jb, 0x89);
+    emit_modrm(&jb, 0, 0, 7);
+
+    emit_ret(&jb);
+
+    jit_code_install(e, &jb, 1 /*scalar width*/, "pxasm_jit_scalar");
+}
+
+/* ============================================================
+   AVX‑512 kernel emission (vectorized variant)
+   ============================================================ */
+
+void jit_compile_avx512(engine *e)
+{
+    jit_builder jb;
+    jb_init(&jb, 128*1024);
+
+    /*
+     * Generated kernel (System V: RDI = data pointer):
+     *
+     *   vmovdqu64 zmm0, [rdi]        ; load 8 x int64
+     *   per op:
+     *     mov rax, <const>           ; materialize constant
+     *     vpbroadcastq zmm1, rax     ; broadcast to all lanes
+     *     vpaddq/vpsubq/vpmullq zmm0, zmm0, zmm1
+     *   vmovdqu64 [rdi], zmm0        ; store back
+     *   ret
+     *
+     * (The previous revision emitted vpaddq/vpmullq zmm0,zmm0,zmm0 and
+     * silently ignored every constant -- now fixed.)
+     */
+
+    // vmovdqu64 zmm0, [rdi]   (EVEX.66.0F.W1 6F -- bytes verified via gcc)
+    jb_emit8(&jb, 0x62); jb_emit8(&jb, 0xF1); jb_emit8(&jb, 0xFE); jb_emit8(&jb, 0x48);
+    jb_emit8(&jb, 0x6F);
+    emit_modrm(&jb, 0, 0, 7);
+
+    for (uint32_t i=0; i<e->pipe.count; ++i) {
+        operator *op = &e->pipe.ops[i];
+
+        switch(op->type){
+            case OP_ADD:
+            case OP_SUB:
+            case OP_MUL:
+                // MOV RAX, imm64
+                emit_mov_imm64(&jb, 0, (uint64_t)(int64_t)op->constant);
+                // vpbroadcastq zmm1, rax   (EVEX.66.0F38.W1 7C /r)
+                jb_emit8(&jb, 0x62); jb_emit8(&jb, 0xF2);
+                jb_emit8(&jb, 0xFD); jb_emit8(&jb, 0x48);
+                jb_emit8(&jb, 0x7C);
+                emit_modrm(&jb, 3, 1, 0);
+                break;
+            default:
+                break;
+        }
+
+        switch(op->type){
+            case OP_ADD:
+                // vpaddq zmm0, zmm0, zmm1  (EVEX.66.0F.W1 D4 /r)
+                jb_emit8(&jb, 0x62); jb_emit8(&jb, 0xF1);
+                jb_emit8(&jb, 0xFD); jb_emit8(&jb, 0x48);
+                jb_emit8(&jb, 0xD4);
+                emit_modrm(&jb, 3, 0, 1);
+                break;
+            case OP_SUB:
+                // vpsubq zmm0, zmm0, zmm1  (EVEX.66.0F.W1 FB /r)
+                jb_emit8(&jb, 0x62); jb_emit8(&jb, 0xF1);
+                jb_emit8(&jb, 0xFD); jb_emit8(&jb, 0x48);
+                jb_emit8(&jb, 0xFB);
+                emit_modrm(&jb, 3, 0, 1);
+                break;
+            case OP_MUL:
+                // vpmullq zmm0, zmm0, zmm1 (EVEX.66.0F38.W1 40 /r)
+                jb_emit8(&jb, 0x62); jb_emit8(&jb, 0xF2);
+                jb_emit8(&jb, 0xFD); jb_emit8(&jb, 0x48);
+                jb_emit8(&jb, 0x40);
+                emit_modrm(&jb, 3, 0, 1);
+                break;
+            case OP_SQUARE:
+                // vpmullq zmm0, zmm0, zmm0
+                jb_emit8(&jb, 0x62); jb_emit8(&jb, 0xF2);
+                jb_emit8(&jb, 0xFD); jb_emit8(&jb, 0x48);
+                jb_emit8(&jb, 0x40);
+                emit_modrm(&jb, 3, 0, 0);
+                break;
+            case OP_DIV: {
+                int64_t c = (int64_t)op->constant;
+                if(c == 1)
+                    break;   /* dividing by 1 is a no-op */
+                int dk, dneg;
+                if(is_pow2_div(c, &dk, &dneg))
+                {
+                    emit_evex_pow2_div(&jb, 0 /*zmm0*/, dk, dneg, 2 /*tmp*/);
+                    break;
+                }
+                div_magic dm;
+                if(c == 0 || c == -1 || !compute_magic_i64(c, &dm))
+                {
+                    /* d == 0 / -1 must still trap with SIGFPE like
+                       idiv (INT64_MIN / -1 included): spill the
+                       lanes, divide each lane scalar, reload. */
+                    // vmovdqu64 [rdi], zmm0
+                    jb_emit8(&jb, 0x62); jb_emit8(&jb, 0xF1);
+                    jb_emit8(&jb, 0xFE); jb_emit8(&jb, 0x48);
+                    jb_emit8(&jb, 0x7F);
+                    emit_modrm(&jb, 0, 0, 7);
+                    // MOV RCX, <divisor>
+                    emit_mov_imm64(&jb, 1, (uint64_t)c);
+                    for(int lane=0; lane<8; lane++)
+                    {
+                        uint8_t d = (uint8_t)(lane*8);
+                        // MOV RAX, [RDI+disp8]
+                        emit_rex64(&jb, 0, 7);
+                        jb_emit8(&jb, 0x8B);
+                        emit_modrm(&jb, 1, 0, 7);
+                        jb_emit8(&jb, d);
+                        // CQO
+                        jb_emit8(&jb, 0x48); jb_emit8(&jb, 0x99);
+                        // IDIV RCX
+                        emit_rex64(&jb, 7, 1);
+                        jb_emit8(&jb, 0xF7);
+                        emit_modrm(&jb, 3, 7, 1);
+                        // MOV [RDI+disp8], RAX
+                        emit_rex64(&jb, 0, 7);
+                        jb_emit8(&jb, 0x89);
+                        emit_modrm(&jb, 1, 0, 7);
+                        jb_emit8(&jb, d);
+                    }
+                    // vmovdqu64 zmm0, [rdi]  (reload)
+                    jb_emit8(&jb, 0x62); jb_emit8(&jb, 0xF1);
+                    jb_emit8(&jb, 0xFE); jb_emit8(&jb, 0x48);
+                    jb_emit8(&jb, 0x6F);
+                    emit_modrm(&jb, 0, 0, 7);
+                    break;
+                }
+                /* Vector Granlund-Montgomery division: broadcast the
+                   6 magic constants into zmm16..zmm21, then divide
+                   all 8 lanes in place (no spill, no idiv). */
+                uint8_t T[10] = {2,3,4,5,6,7,8,9,10,11};
+                uint8_t C[6]  = {16,17,18,19,20,21};
+                emit_mov_imm64(&jb, 0, dm.magic & 0xFFFFFFFFULL);
+                emit_vpbroadcastq(&jb, C[0], 0);
+                emit_mov_imm64(&jb, 0, dm.magic >> 32);
+                emit_vpbroadcastq(&jb, C[1], 0);
+                emit_mov_imm64(&jb, 0, 0xFFFFFFFFULL);
+                emit_vpbroadcastq(&jb, C[2], 0);
+                emit_mov_imm64(&jb, 0, 1ULL << 32);
+                emit_vpbroadcastq(&jb, C[3], 0);
+                emit_mov_imm64(&jb, 0, 0x8000000000000000ULL);
+                emit_vpbroadcastq(&jb, C[4], 0);
+                emit_mov_imm64(&jb, 0, 0xFFFFFFFFFFFFFFFFULL);
+                emit_vpbroadcastq(&jb, C[5], 0);
+                emit_evex_magic_div(&jb, 0 /*zmm0*/, c, T, C);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    // vmovdqu64 [rdi], zmm0
+    jb_emit8(&jb, 0x62); jb_emit8(&jb, 0xF1); jb_emit8(&jb, 0xFE); jb_emit8(&jb, 0x48);
+    jb_emit8(&jb, 0x7F);
+    emit_modrm(&jb, 0, 0, 7);
+
+    emit_ret(&jb);
+
+    jit_code_install(e, &jb, 8 /*processes 8 packed int64s*/, "pxasm_jit_avx512");
+}
+
