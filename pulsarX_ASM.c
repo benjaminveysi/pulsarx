@@ -2317,3 +2317,245 @@ void jit_compile_avx512(engine *e)
     jit_code_install(e, &jb, 8 /*processes 8 packed int64s*/, "pxasm_jit_avx512");
 }
 
+/* ============================================================
+   AVX-512 v3 kernel: 4x unrolled, constants pinned in zmm16..31
+   ------------------------------------------------------------
+   Processes 32 packed int64s per call (4 x zmm0..zmm3), so the
+   CALL/RET count drops 4x vs the old 8-wide kernel and the four
+   independent vector chains overlap (ILP hides vpmullq latency).
+   Pipeline constants are broadcast ONCE in the prologue into
+   zmm16..zmm31 (caller-saved); every op reads them from there.
+   use_nt: store with VMOVNTDQ (streaming, for arrays larger than
+   L3) instead of VMOVDQU64; the caller fences once after the pass.
+   Returns 0 (caller falls back to the old 8-wide kernel) when the
+   pipeline has >16 constant ops, when a magic DIV would need more
+   constant registers than the pool holds, or when the divisor is
+   0 (whose SIGFPE must be produced by idiv in the old kernel).
+   ============================================================ */
+
+/* Build the v3 kernel into a caller-supplied (already jb_init'ed)
+   builder. Returns 1 on success, 0 when the pipeline needs a
+   fallback (DIV by 0, too many constants). On failure the builder's
+   buffer is released, so the caller must not use it. The emitted
+   function processes 32 packed int64s per call. */
+static int jit_build_avx512_v3(jit_builder *jb, pipeline *p, int use_nt)
+{
+    int nconst = 0, has_magic_div = 0;
+    for(uint32_t i = 0; i < p->count; i++)
+    {
+        operator *op = &p->ops[i];
+        if(op->type == OP_ADD || op->type == OP_SUB || op->type == OP_MUL ||
+           op->type == OP_CMP_GT || op->type == OP_SELECT || op->type == OP_BIT_XOR)
+            nconst++;
+        else if(op->type == OP_DIV)
+        {
+            int64_t c = (int64_t)op->constant;
+            if(c == 0)
+            {
+                munmap(jb->mem.mem, jb->mem.size);   /* leave the trap to the old kernel */
+                return 0;
+            }
+            if(c != 1 && c != -1)
+            {
+                int dk, dneg;
+                if(!is_pow2_div(c, &dk, &dneg))
+                    has_magic_div = 1;
+            }
+        }
+    }
+    if(nconst > 16)
+    {
+        munmap(jb->mem.mem, jb->mem.size);
+        return 0;
+    }
+    if(has_magic_div && nconst > 10)
+    {
+        munmap(jb->mem.mem, jb->mem.size);
+        return 0;   /* 6 magic slots */
+    }
+
+    /* Map each op to its pinned constant register (zmm16+j) or -1. */
+    int8_t creg[PULSAR_MAX_PIPE];
+    int cj = 0;
+    for(uint32_t i = 0; i < p->count; i++)
+    {
+        operator *op = &p->ops[i];
+        if(op->type == OP_ADD || op->type == OP_SUB || op->type == OP_MUL ||
+           op->type == OP_CMP_GT || op->type == OP_SELECT || op->type == OP_BIT_XOR)
+            creg[i] = (int8_t)(16 + cj++);
+        else
+            creg[i] = -1;
+    }
+    /* Magic-division constants live after the pipeline constants. */
+    uint8_t magic_base = (uint8_t)(16 + nconst);
+
+    /* Prologue: broadcast the pipeline constants once. */
+    for(uint32_t i = 0; i < p->count; i++)
+    {
+        if(creg[i] < 0) continue;
+        emit_mov_imm64(jb, 0, (uint64_t)(int64_t)p->ops[i].constant);
+        emit_vpbroadcastq(jb, (uint8_t)creg[i], 0);
+    }
+
+    /* Load the 4 vectors (32 records). */
+    for(int v = 0; v < 4; v++)
+        emit_evex_mem_disp(jb, 0x6F, 2 /*F3*/, 1, (uint8_t)v, v * 64);
+
+    /* §5 k-mask state: OP_CMP_GT sets per-vector masks k1..k4; the
+       next op consumes them (masked, merging) and clears the flag.
+       With no preceding CMP_GT the mask is 0 (unmasked). */
+    int mask_pending = 0;
+    for(uint32_t i = 0; i < p->count; i++)
+    {
+        operator *op = &p->ops[i];
+        switch(op->type)
+        {
+            case OP_ADD:
+                for(int v = 0; v < 4; v++)
+                    emit_vpaddq(jb, (uint8_t)v, (uint8_t)v, (uint8_t)creg[i],
+                                mask_pending ? (uint8_t)(v + 1) : 0);
+                mask_pending = 0;
+                break;
+            case OP_SUB:
+                for(int v = 0; v < 4; v++)
+                    emit_vpsubq(jb, (uint8_t)v, (uint8_t)v, (uint8_t)creg[i],
+                                mask_pending ? (uint8_t)(v + 1) : 0);
+                mask_pending = 0;
+                break;
+            case OP_MUL:
+                for(int v = 0; v < 4; v++)
+                    emit_vpmullq(jb, (uint8_t)v, (uint8_t)v, (uint8_t)creg[i],
+                                 mask_pending ? (uint8_t)(v + 1) : 0);
+                mask_pending = 0;
+                break;
+            case OP_SQUARE:
+                for(int v = 0; v < 4; v++)
+                    emit_vpmullq(jb, (uint8_t)v, (uint8_t)v, (uint8_t)v,
+                                 mask_pending ? (uint8_t)(v + 1) : 0);
+                mask_pending = 0;
+                break;
+            case OP_CMP_GT:
+                /* k(v+1) = (acc_v > creg). One mask per vector. */
+                for(int v = 0; v < 4; v++)
+                    emit_vpcmpgtq(jb, (uint8_t)(v + 1), (uint8_t)v, (uint8_t)creg[i]);
+                mask_pending = 1;
+                break;
+            case OP_SELECT:
+                /* acc_v = pred ? creg : acc_v (masked move, merging). */
+                for(int v = 0; v < 4; v++)
+                    emit_vmovdqa64_rr_masked(jb, (uint8_t)v, (uint8_t)creg[i],
+                                             mask_pending ? (uint8_t)(v + 1) : 0);
+                mask_pending = 0;
+                break;
+            case OP_BIT_XOR:
+                for(int v = 0; v < 4; v++)
+                    emit_vpxorq(jb, (uint8_t)v, (uint8_t)v, (uint8_t)creg[i],
+                                mask_pending ? (uint8_t)(v + 1) : 0);
+                mask_pending = 0;
+                break;
+            case OP_DIV: {
+                int64_t c = (int64_t)op->constant;
+                if(c == 1)
+                {
+                    mask_pending = 0;
+                    break;
+                }
+                uint8_t T[10] = {4,5,6,7,8,9,10,11,12,13};
+                uint8_t C[6] = {(uint8_t)magic_base, (uint8_t)(magic_base + 1),
+                                (uint8_t)(magic_base + 2), (uint8_t)(magic_base + 3),
+                                (uint8_t)(magic_base + 4), (uint8_t)(magic_base + 5)};
+                /* For a magic DIV, broadcast the 6 constants once
+                   (shared by all 4 accumulators / the temp). */
+                if(c != -1)
+                {
+                    int dk0, dneg0;
+                    if(!is_pow2_div(c, &dk0, &dneg0))
+                    {
+                        div_magic dm;
+                        if(!compute_magic_i64(c, &dm))
+                        {
+                            munmap(jb->mem.mem, jb->mem.size);
+                            return 0;   /* cannot happen; be safe */
+                        }
+                        emit_mov_imm64(jb, 0, dm.magic & 0xFFFFFFFFULL);
+                        emit_vpbroadcastq(jb, C[0], 0);
+                        emit_mov_imm64(jb, 0, dm.magic >> 32);
+                        emit_vpbroadcastq(jb, C[1], 0);
+                        emit_mov_imm64(jb, 0, 0xFFFFFFFFULL);
+                        emit_vpbroadcastq(jb, C[2], 0);
+                        emit_mov_imm64(jb, 0, 1ULL << 32);
+                        emit_vpbroadcastq(jb, C[3], 0);
+                        emit_mov_imm64(jb, 0, 0x8000000000000000ULL);
+                        emit_vpbroadcastq(jb, C[4], 0);
+                        emit_mov_imm64(jb, 0, 0xFFFFFFFFFFFFFFFFULL);
+                        emit_vpbroadcastq(jb, C[5], 0);
+                    }
+                }
+                if(c == -1)
+                    emit_vpxorq(jb, 4, 4, 4, 0);   /* zmm4 = 0 (once) */
+                for(int v = 0; v < 4; v++)
+                {
+                    /* Masked DIV: compute into temp zmm14 (a copy of
+                       acc_v), then blend back under k(v+1) so the
+                       masked-off lanes keep their old value.
+                       Unmasked: DIV straight into acc_v. */
+                    uint8_t tgt = mask_pending ? 14 : (uint8_t)v;
+                    if(mask_pending)
+                        emit_vmovdqa64_rr(jb, 14, (uint8_t)v);
+                    if(c == -1)
+                    {
+                        /* DIV -1 == NEG */
+                        emit_vpsubq(jb, tgt, 4, tgt, 0);
+                    }
+                    else
+                    {
+                        int dk, dneg;
+                        if(is_pow2_div(c, &dk, &dneg))
+                            emit_evex_pow2_div(jb, tgt, dk, dneg, 4 /*tmp*/);
+                        else
+                            emit_evex_magic_div(jb, tgt, c, T, C);
+                    }
+                    if(mask_pending)
+                        emit_vmovdqa64_rr_masked(jb, (uint8_t)v, 14, (uint8_t)(v + 1));
+                }
+                mask_pending = 0;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    /* Store back: normal (VMOVDQU64) or non-temporal.
+       NT path uses one 512-bit EVEX VMOVNTDQ per vector. That
+       instruction faults on a misaligned address (it needs the
+       64-byte vector alignment; malloc only gives 16), so the
+       caller (execute_jit_records) peels the unaligned head
+       through the interpreter before the NT bulk loop. */
+    for(int v = 0; v < 4; v++)
+    {
+        if(use_nt)
+            emit_evex_mem_disp(jb, 0xE7, 1 /*66*/, 0 /*W0*/, (uint8_t)v, v * 64);
+        else
+            emit_evex_mem_disp(jb, 0x7F, 2 /*F3*/, 1, (uint8_t)v, v * 64);
+    }
+
+    emit_ret(jb);
+    return 1;
+}
+
+/* Engine wrapper: build the v3 kernel and install it as the engine's
+   JIT function (32 records per call, plus the NT variant). */
+static int jit_compile_avx512_v3(engine *e, int use_nt)
+{
+    jit_builder jb;
+    jb_init(&jb, 128*1024);
+    if(!jit_build_avx512_v3(&jb, &e->pipe, use_nt))
+        return 0;   /* builder buffer already released */
+    if(use_nt)
+        jit_code_install_nt(e, &jb);
+    else
+        jit_code_install(e, &jb, 32 /*processes 32 packed int64s*/, "pxasm_jit_v3");
+    return 1;
+}
+
