@@ -2559,3 +2559,235 @@ static int jit_compile_avx512_v3(engine *e, int use_nt)
     return 1;
 }
 
+/* ============================================================
+   VEX backend — Ivy Bridge / Haswell
+   ------------------------------------------------------------
+   One builder, one flag, two widths: only VEX.L flips. L=0 is
+   128-bit xmm (2 x int64, Ivy Bridge, 8 records/call), L=1 is
+   256-bit ymm (4 x int64, Haswell, 16 records/call). Regs: accum
+   0..3, masks 4..7, pinned constants 8..15, scratch 14/15.
+   Gaps vs AVX-512, all closed here: no VPMULLQ, so 64-bit MUL is
+   synthesised from VPMULUDQ; no VPSRAQ in VEX at all, so DIV spills
+   to [RDI] and divides per lane (SIGFPE preserved); no k masks,
+   so CMP_GT writes a full vector mask and SELECT uses VPBLENDVB.
+   Builder returns 0 -> the scalar JIT runs instead. Every encoding
+   below was checked byte-for-byte against `as`.
+   ============================================================ */
+
+/* VEX 3-byte prefix: C4 [R X B mmmmm] [W vvvv L pp].
+   R = ~dst[3], B = ~rm[3], mm: 1 = 0F, 2 = 0F38, 3 = 0F3A.
+   W is 0 for every op here except VMOVQ. */
+static inline void emit_vex(jit_builder *jb, uint8_t mm, uint8_t w, uint8_t pp,
+                            uint8_t dst, uint8_t src1, uint8_t src2, uint8_t L)
+{
+    uint8_t p0 = (uint8_t)(((dst & 8) ? 0 : 0x80) | 0x40 |
+                          ((src2 & 8) ? 0 : 0x20) | mm);
+    uint8_t p1 = (uint8_t)((w ? 0x80 : 0) | (((~src1) & 0xF) << 3) |
+                          ((L & 1) << 2) | pp);
+    jb_emit8(jb, 0xC4);
+    jb_emit8(jb, p0);
+    jb_emit8(jb, p1);
+}
+
+/* 3-operand vector ALU: dst = op(src1, src2). */
+static inline void emit_vex_3(jit_builder *jb, uint8_t mm, uint8_t opcode,
+                              uint8_t dst, uint8_t s1, uint8_t s2, uint8_t L,
+                              uint8_t w, uint8_t pp)
+{
+    emit_vex(jb, mm, w, pp, dst, s1, s2, L);
+    jb_emit8(jb, opcode);
+    emit_modrm(jb, 3, dst, s2);
+}
+
+/* 2-operand form (moves, broadcast): dst = op(src); vvvv unused. */
+static inline void emit_vex_2(jit_builder *jb, uint8_t mm, uint8_t opcode,
+                              uint8_t dst, uint8_t src, uint8_t L,
+                              uint8_t w, uint8_t pp)
+{
+    emit_vex(jb, mm, w, pp, dst, 0, src, L);
+    jb_emit8(jb, opcode);
+    emit_modrm(jb, 3, dst, src);
+}
+
+/* Shift by immediate: destination in vvvv, source in ModRM.rm,
+   sub-opcode in ModRM.reg. Same shape as the EVEX shift helper.
+   VPSRLQ = 0x73 /2, VPSLLQ = 0x73 /6 (0x72 is VPSRAQ's opcode,
+   which has no VEX form — see the header note). */
+static inline void emit_vex_shift_imm(jit_builder *jb, uint8_t opcode, uint8_t sub,
+                                      uint8_t dst, uint8_t src, uint8_t imm, uint8_t L)
+{
+    emit_vex(jb, 1, 0, 1, sub, dst, src, L);
+    jb_emit8(jb, opcode);
+    emit_modrm(jb, 3, sub, src);
+    jb_emit8(jb, imm);
+}
+
+/* Load/store through [RDI + disp]. opcode 0x6F = load, 0x7F = store
+   (VMOVDQU, pp = F3). disp == 0 uses mod 0, else mod 2 + disp32. */
+static inline void emit_vex_mem_disp(jit_builder *jb, uint8_t opcode, uint8_t reg,
+                                     int32_t disp, uint8_t L)
+{
+    emit_vex(jb, 1, 0, 2, reg, 0, 7 /*RDI*/, L);
+    jb_emit8(jb, opcode);
+    if(disp == 0)
+        emit_modrm(jb, 0, reg, 7);
+    else
+    {
+        emit_modrm(jb, 2, reg, 7);
+        jb_emit32(jb, (uint32_t)disp);
+    }
+}
+
+static inline void vex_vpaddq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t L){
+    emit_vex_3(jb, 1, 0xD4, dst, s1, s2, L, 0, 1);
+}
+static inline void vex_vpsubq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t L){
+    emit_vex_3(jb, 1, 0xFB, dst, s1, s2, L, 0, 1);
+}
+static inline void vex_vpxorq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t L){
+    emit_vex_3(jb, 1, 0xEF, dst, s1, s2, L, 0, 1);
+}
+static inline void vex_vpandq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t L){
+    emit_vex_3(jb, 1, 0xDB, dst, s1, s2, L, 0, 1);
+}
+static inline void vex_vporq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t L){
+    emit_vex_3(jb, 1, 0xEB, dst, s1, s2, L, 0, 1);
+}
+/* VPMULUDQ: 32-bit unsigned multiply, full 64-bit product of the
+   low 32 bits of each lane (0F F4, mm = 01 — same quirk as EVEX). */
+static inline void vex_vpmuludq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t L){
+    emit_vex_3(jb, 1, 0xF4, dst, s1, s2, L, 0, 1);
+}
+static inline void vex_vpsrlq(jit_builder *jb, uint8_t dst, uint8_t src, uint8_t imm, uint8_t L){
+    emit_vex_shift_imm(jb, 0x73, 2, dst, src, imm, L);  /* 0x73, not 0x72. cost me an afternoon once. */
+}
+static inline void vex_vpsllq(jit_builder *jb, uint8_t dst, uint8_t src, uint8_t imm, uint8_t L){
+    emit_vex_shift_imm(jb, 0x73, 6, dst, src, imm, L);
+}
+
+/* VMOVDQA reg,reg copy (pp = 66, opcode 0x6F). */
+static inline void vex_vmovdqa_rr(jit_builder *jb, uint8_t dst, uint8_t src, uint8_t L){
+    emit_vex_2(jb, 1, 0x6F, dst, src, L, 0, 1);
+}
+
+/* VPCMPGTQ dst, s1, s2 (0F38 37): per-lane all-ones where s1 > s2
+   (signed), zero elsewhere — the VEX replacement for a k mask. */
+static inline void vex_vpcmpgtq(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2, uint8_t L){
+    emit_vex_3(jb, 2, 0x37, dst, s1, s2, L, 0, 1);
+}
+
+/* VPBLENDVB dst, s1(false), s2(true), mask — mask reg in imm8[7:4].
+   dst = mask ? s2 : s1, per byte (mask lanes are all-ones / zero,
+   so this is an exact lane select). */
+static inline void vex_vpblendvb(jit_builder *jb, uint8_t dst, uint8_t s1, uint8_t s2,
+                                 uint8_t mask, uint8_t L){
+    emit_vex_3(jb, 3, 0x4C, dst, s1, s2, L, 0, 1);
+    jb_emit8(jb, (uint8_t)(mask << 4));
+}
+
+/* Broadcast RAX into vector dst. Ivy: VMOVQ xmm7,RAX + VPUNPCKLQDQ
+   (copies the low qword to the high half); Haswell: VMOVQ xmm7,RAX
+   + VPBROADCASTQ ymm,xmm7. xmm7 is the broadcast scratch: dead in
+   the prologue, and mid-pipeline only used by the unmasked
+   full-MUL path, where no mask lives in 4..7. */
+static void vex_broadcast_rax(jit_builder *jb, uint8_t dst, uint8_t L)
+{
+    /* VMOVQ xmm7, RAX (VEX.128.66.0F.W1 6E /r — W=1 is load-bearing
+       here: it selects the 64-bit form over MOVD xmm,r32). */
+    emit_vex_2(jb, 1, 0x6E, 7, 0 /*RAX*/, 0 /*L=0*/, 1 /*W*/, 1);
+    if(L)
+        emit_vex_2(jb, 2, 0x59, dst, 7, 1, 0, 1);   /* VPBROADCASTQ ymm, xmm */
+    else
+        emit_vex_3(jb, 1, 0x6C, dst, 7, 7, 0, 0, 1); /* VPUNPCKLQDQ xmm, xmm7, xmm7 */
+}
+
+/* MUL classification for the VEX synthesis (no VPMULLQ on AVX2/AVX1). */
+#define VEX_MUL_ZERO 0
+#define VEX_MUL_ONE 1
+#define VEX_MUL_NEG 2
+#define VEX_MUL_SHL 3
+#define VEX_MUL_SHL_NEG 4
+#define VEX_MUL_U32 5
+#define VEX_MUL_FULL 6
+static int vex_mul_kind(int64_t c, int *k)
+{
+    if(c == 0) return VEX_MUL_ZERO;
+    if(c == 1) return VEX_MUL_ONE;
+    if(c == -1) return VEX_MUL_NEG;
+    if(c > 0 && (c & (c - 1)) == 0)
+    {
+        *k = __builtin_ctzll((uint64_t)c);
+        return VEX_MUL_SHL;
+    }
+    if(c < 0 && c != INT64_MIN && ((-c) & ((-c) - 1)) == 0)
+    {
+        *k = __builtin_ctzll((uint64_t)(-c));
+        return VEX_MUL_SHL_NEG;
+    }
+    if(c >= 0 && (uint64_t)c < (1ULL << 32)) return VEX_MUL_U32;
+    return VEX_MUL_FULL;
+}
+
+/* dst = src * creg, 0 <= c < 2^32 (golden path): 5 instructions.
+   x*c = xlo*c + ((xhi*c) << 32); both products fit in 64 bits
+   because both factors are < 2^32. t0, t1 are scratch vectors
+   (dst may alias t0: it is only read by the final add). */
+static void vex_mul_u32(jit_builder *jb, uint8_t dst, uint8_t src, uint8_t creg,
+                        uint8_t t0, uint8_t t1, uint8_t L)
+{
+    vex_vpmuludq(jb, t0, src, creg, L);      /* xlo*c */
+    vex_vpsrlq(jb, t1, src, 32, L);          /* xhi */
+    vex_vpmuludq(jb, t1, t1, creg, L);       /* xhi*c */
+    vex_vpsllq(jb, t1, t1, 32, L);           /* (xhi*c) << 32 */
+    vex_vpaddq(jb, dst, t0, t1, L);          /* dst = t0 + t1 */
+}
+
+/* dst = src * c for a full 64-bit constant: x*c = xlo*clo +
+   ((xlo*chi + xhi*clo) << 32) (mod 2^64). Uses all six scratch
+   vectors (4..7, 14, 15) — caller must guarantee no pinned
+   constant lives in 14/15 and no mask is pending. */
+static void vex_mul_full(jit_builder *jb, uint8_t dst, uint8_t src, int64_t c, uint8_t L)
+{
+    uint64_t clo = (uint64_t)c & 0xFFFFFFFFULL;
+    uint64_t chi = (uint64_t)c >> 32;
+    emit_mov_imm64(jb, 0, clo);
+    vex_broadcast_rax(jb, 4, L);
+    emit_mov_imm64(jb, 0, chi);
+    vex_broadcast_rax(jb, 5, L);
+    vex_vpsrlq(jb, 6, src, 32, L);          /* xhi */
+    vex_vpmuludq(jb, 14, src, 4, L);        /* p0 = xlo*clo */
+    vex_vpmuludq(jb, 15, src, 5, L);        /* p1 = xlo*chi */
+    vex_vpmuludq(jb, 7, 6, 4, L);           /* p2 = xhi*clo */
+    vex_vpaddq(jb, 15, 15, 7, L);           /* p1 += p2 */
+    vex_vpsllq(jb, 15, 15, 32, L);          /* p1 <<= 32 */
+    vex_vpaddq(jb, dst, 14, 15, L);         /* dst = p0 + p1 */
+}
+
+/* dst = src * src (mod 2^64): x^2 = xlo^2 + ((2*xlo*xhi) << 32).
+   2 x VPMULUDQ only. t0, t1 are scratch vectors. */
+static void vex_square(jit_builder *jb, uint8_t dst, uint8_t src,
+                       uint8_t t0, uint8_t t1, uint8_t L)
+{
+    vex_vpmuludq(jb, t0, src, src, L);      /* xlo^2 */
+    vex_vpsrlq(jb, t1, src, 32, L);         /* xhi */
+    vex_vpmuludq(jb, t1, src, t1, L);       /* xlo*xhi */
+    vex_vpsllq(jb, t1, t1, 33, L);          /* <<33 == 2*(..)<<32 */
+    vex_vpaddq(jb, dst, t0, t1, L);
+}
+
+/* Scalar lane access for fallback DIV by 0 / INT64_MIN/-1 trap: */
+static inline void vex_spill_load_rax(jit_builder *jb, uint8_t off)
+{
+    emit_rex64(jb, 0, 7);
+    jb_emit8(jb, 0x8B);
+    emit_modrm(jb, 1, 0, 7);
+    jb_emit8(jb, off);
+}
+static inline void vex_spill_store_rax(jit_builder *jb, uint8_t off)
+{
+    emit_rex64(jb, 0, 7);
+    jb_emit8(jb, 0x89);
+    emit_modrm(jb, 1, 0, 7);
+    jb_emit8(jb, off);
+}
+
