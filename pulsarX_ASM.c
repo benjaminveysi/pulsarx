@@ -2791,3 +2791,384 @@ static inline void vex_spill_store_rax(jit_builder *jb, uint8_t off)
     jb_emit8(jb, off);
 }
 
+/* ============================================================
+   v5 (§9): Native Vector VEX Division without VPSRAQ
+   ------------------------------------------------------------
+   VEX (Ivy Bridge AVX1 / Haswell AVX2) lacks VPSRAQ (0x72 /4 is
+   EVEX-only) and k-mask registers. We synthesise exact 64-bit
+   arithmetic right shift and Granlund-Montgomery signed magic
+   division entirely in XMM/YMM registers using two's-complement
+   sign-mask identities:
+     1. sign = (0 > acc) via VPCMPGTQ (exact replacement for
+        acc >>_arith 63).
+     2. sra(x, k) = (x >>_logical k) | ((0 > x) << (64 - k)).
+     3. Unsigned 64-bit addition overflow carry (t2 + t3 < t2):
+        ovf = VPCMPGTQ(t2 ^ SIGNBIT, S ^ SIGNBIT), shifted by
+        (>>_logical 63) then (<< 32) to yield (ovf ? 2^32 : 0)
+        without k-masks.
+   ============================================================ */
+
+static void emit_vex_pow2_div(jit_builder *jb, uint8_t acc, int k, int neg,
+                              uint8_t t0, uint8_t L)
+{
+    vex_vpxorq(jb, t0, t0, t0, L);
+    vex_vpcmpgtq(jb, t0, t0, acc, L);
+    vex_vpsrlq(jb, t0, t0, (uint8_t)(64 - k), L);
+    vex_vpaddq(jb, acc, acc, t0, L);
+    vex_vpxorq(jb, t0, t0, t0, L);
+    vex_vpcmpgtq(jb, t0, t0, acc, L);
+    vex_vpsllq(jb, t0, t0, (uint8_t)(64 - k), L);
+    vex_vpsrlq(jb, acc, acc, (uint8_t)k, L);
+    vex_vporq(jb, acc, acc, t0, L);
+    if(neg)
+    {
+        vex_vpxorq(jb, t0, t0, t0, L);
+        vex_vpsubq(jb, acc, t0, acc, L);
+    }
+}
+
+static int emit_vex_magic_div(jit_builder *jb, uint8_t acc, int64_t d, uint8_t L)
+{
+    div_magic dm;
+    if(!compute_magic_i64(d, &dm))
+        return 0;
+
+    uint8_t sign = 4, Mlo = 5, Mhi = 6, a_hi = 7;
+    uint8_t t1 = 8, t2 = 9, t3 = 10, t4 = 11, S = 12, hi = 13, u = 14, w = 15;
+
+    vex_vpxorq(jb, sign, sign, sign, L);
+    vex_vpcmpgtq(jb, sign, sign, acc, L);
+    vex_vpxorq(jb, acc, acc, sign, L);
+    vex_vpsubq(jb, acc, acc, sign, L);
+
+    emit_mov_imm64(jb, 0, dm.magic & 0xFFFFFFFFULL);
+    vex_broadcast_rax(jb, Mlo, L);
+    emit_mov_imm64(jb, 0, dm.magic >> 32);
+    vex_broadcast_rax(jb, Mhi, L);
+
+    vex_vpsrlq(jb, a_hi, acc, 32, L);
+    vex_vpmuludq(jb, t1, acc, Mlo, L);
+    vex_vpmuludq(jb, t2, acc, Mhi, L);
+    vex_vpmuludq(jb, t3, a_hi, Mlo, L);
+    vex_vpmuludq(jb, t4, a_hi, Mhi, L);
+    vex_vpaddq(jb, S, t2, t3, L);
+    vex_vpsrlq(jb, hi, S, 32, L);
+
+    vex_vpsrlq(jb, u, t1, 32, L);
+    vex_vpsllq(jb, w, S, 32, L);
+    vex_vpsrlq(jb, w, w, 32, L);
+    vex_vpaddq(jb, w, u, w, L);
+    vex_vpsrlq(jb, w, w, 32, L);
+    vex_vpaddq(jb, hi, t4, hi, L);
+    vex_vpaddq(jb, hi, hi, w, L);
+
+    emit_mov_imm64(jb, 0, 0x8000000000000000ULL);
+    vex_broadcast_rax(jb, u, L);
+    vex_vpxorq(jb, t2, t2, u, L);
+    vex_vpxorq(jb, S, S, u, L);
+    vex_vpcmpgtq(jb, w, t2, S, L);
+    vex_vpsrlq(jb, w, w, 63, L);
+    vex_vpsllq(jb, w, w, 32, L);
+    vex_vpaddq(jb, hi, hi, w, L);
+
+    if(dm.shift > 0)
+        vex_vpsrlq(jb, hi, hi, (uint8_t)dm.shift, L);
+    if(d < 0)
+    {
+        emit_mov_imm64(jb, 0, ~0ULL);
+        vex_broadcast_rax(jb, u, L);
+        vex_vpxorq(jb, sign, sign, u, L);
+    }
+    vex_vpxorq(jb, hi, hi, sign, L);
+    vex_vpsubq(jb, acc, hi, sign, L);
+    return 1;
+}
+
+static void vex_mul_vv(jit_builder *jb, uint8_t dst, uint8_t acc,
+                       uint8_t x, uint8_t x_hi, uint8_t t0, uint8_t t1, uint8_t L)
+{
+    vex_vpsrlq(jb, t0, acc, 32, L);
+    vex_vpmuludq(jb, t0, t0, x, L);
+    vex_vpmuludq(jb, t1, acc, x_hi, L);
+    vex_vpaddq(jb, t0, t0, t1, L);
+    vex_vpsllq(jb, t0, t0, 32, L);
+    vex_vpmuludq(jb, dst, acc, x, L);
+    vex_vpaddq(jb, dst, dst, t0, L);
+}
+
+/* Build the VEX kernel into a caller-supplied (already jb_init'ed)
+   builder. Same failure contract as jit_build_avx512_v3: on failure
+   the builder's buffer is released and the caller must not use it.
+   The emitted function processes 16 packed int64s per call on
+   Haswell (is_avx2 = 1) or 8 on Ivy Bridge (is_avx2 = 0). */
+static int jit_build_vex(jit_builder *jb, pipeline *p, int is_avx2)
+{
+    uint8_t L = is_avx2 ? 1 : 0;
+    int width = is_avx2 ? 4 : 2;
+    int stride = width * 8;
+
+    int nconst = 0, has_mul = 0, has_square = 0, has_kmask = 0;
+    int mask_pending = 0;
+    for(uint32_t i = 0; i < p->count; i++)
+    {
+        operator *op = &p->ops[i];
+        switch(op->type)
+        {
+            case OP_ADD: case OP_SUB: case OP_MUL:
+            case OP_CMP_GT: case OP_SELECT: case OP_BIT_XOR:
+                nconst++;
+                break;
+            default:
+                break;
+        }
+        if(op->type == OP_MUL) has_mul = 1;
+        if(op->type == OP_SQUARE) has_square = 1;
+        if(op->type == OP_CMP_GT || op->type == OP_SELECT || op->type == OP_BIT_XOR)
+            has_kmask = 1;
+        /* A masked MUL needing the full 64-bit synthesis would
+           clobber the mask registers (4..7 double as its scratch),
+           and a masked DIV cannot be spilled per-lane — both fall
+           back to the scalar JIT instead of emitting wrong code. */
+        if(op->type == OP_DIV && mask_pending) {
+            int dk_p = 0, dneg_p = 0;
+            if((int64_t)op->constant != 1 && !is_pow2_div((int64_t)op->constant, &dk_p, &dneg_p))
+                goto fail;
+        }
+        if(op->type == OP_MUL && mask_pending)
+        {
+            int k = 0;
+            if(vex_mul_kind((int64_t)op->constant, &k) == VEX_MUL_FULL) goto fail;
+        }
+        if(op->type == OP_CMP_GT)
+            mask_pending = 1;
+        else
+            mask_pending = 0;
+    }
+    if(nconst > 8) goto fail;
+    /* MUL/SQUARE synthesis and masked ops need scratch vectors 14/15
+       free, so pipelines using them are limited to 6 pinned constants. */
+    if((has_mul || has_square || has_kmask) && nconst > 6) goto fail;
+
+    /* Map each op to its pinned constant register (ymm/xmm 8+j) or -1. */
+    int8_t creg[PULSAR_MAX_PIPE];
+    int cj = 0;
+    for(uint32_t i = 0; i < p->count; i++)
+    {
+        operator *op = &p->ops[i];
+        if(op->type == OP_ADD || op->type == OP_SUB || op->type == OP_MUL ||
+           op->type == OP_CMP_GT || op->type == OP_SELECT || op->type == OP_BIT_XOR)
+            creg[i] = (int8_t)(8 + cj++);
+        else
+            creg[i] = -1;
+    }
+
+    /* Prologue: broadcast the pipeline constants once. */
+    for(uint32_t i = 0; i < p->count; i++)
+    {
+        if(creg[i] < 0) continue;
+        emit_mov_imm64(jb, 0, (uint64_t)(int64_t)p->ops[i].constant);
+        vex_broadcast_rax(jb, (uint8_t)creg[i], L);
+    }
+
+    /* Load the 4 vectors. */
+    for(int v = 0; v < 4; v++)
+        emit_vex_mem_disp(jb, 0x6F, (uint8_t)v, v * stride, L);
+
+    /* §5 predicate: OP_CMP_GT writes per-vector masks into 4..7;
+       the next op consumes them (via VPBLENDVB) and clears the flag. */
+    mask_pending = 0;
+    for(uint32_t i = 0; i < p->count; i++)
+    {
+        operator *op = &p->ops[i];
+        switch(op->type)
+        {
+            case OP_ADD:
+            case OP_SUB:
+            case OP_BIT_XOR:
+                /* Masked: compute into scratch 14, blend back under
+                   mask (4+v); unmasked: straight into the accumulator. */
+                for(int v = 0; v < 4; v++)
+                {
+                    uint8_t acc = (uint8_t)v;
+                    if(mask_pending)
+                    {
+                        if(op->type == OP_ADD)
+                            vex_vpaddq(jb, 14, acc, (uint8_t)creg[i], L);
+                        else if(op->type == OP_SUB)
+                            vex_vpsubq(jb, 14, acc, (uint8_t)creg[i], L);
+                        else
+                            vex_vpxorq(jb, 14, acc, (uint8_t)creg[i], L);
+                        vex_vpblendvb(jb, acc, acc, 14, (uint8_t)(4 + v), L);
+                    }
+                    else
+                    {
+                        if(op->type == OP_ADD)
+                            vex_vpaddq(jb, acc, acc, (uint8_t)creg[i], L);
+                        else if(op->type == OP_SUB)
+                            vex_vpsubq(jb, acc, acc, (uint8_t)creg[i], L);
+                        else
+                            vex_vpxorq(jb, acc, acc, (uint8_t)creg[i], L);
+                    }
+                }
+                mask_pending = 0;
+                break;
+            case OP_CMP_GT:
+                for(int v = 0; v < 4; v++)
+                    vex_vpcmpgtq(jb, (uint8_t)(4 + v), (uint8_t)v, (uint8_t)creg[i], L);
+                mask_pending = 1;
+                break;
+            case OP_SELECT:
+                for(int v = 0; v < 4; v++)
+                {
+                    if(mask_pending)
+                        vex_vpblendvb(jb, (uint8_t)v, (uint8_t)v, (uint8_t)creg[i],
+                                      (uint8_t)(4 + v), L);
+                    else
+                        vex_vmovdqa_rr(jb, (uint8_t)v, (uint8_t)creg[i], L);
+                }
+                mask_pending = 0;
+                break;
+            case OP_MUL: {
+                int64_t c = (int64_t)op->constant;
+                int k = 0;
+                int kind = vex_mul_kind(c, &k);
+                for(int v = 0; v < 4; v++)
+                {
+                    uint8_t acc = (uint8_t)v;
+                    /* Masked: compute into scratch 14, blend back.
+                       The full synthesis writes straight into acc and
+                       is unmasked only (pre-scan guarantees it). */
+                    uint8_t dst = mask_pending ? 14 : acc;
+                    switch(kind)
+                    {
+                        case VEX_MUL_ZERO:
+                            vex_vpxorq(jb, dst, dst, dst, L);
+                            break;
+                        case VEX_MUL_ONE:
+                            if(dst != acc) vex_vmovdqa_rr(jb, dst, acc, L);
+                            break;
+                        case VEX_MUL_NEG:
+                            vex_vpxorq(jb, 15, 15, 15, L);
+                            vex_vpsubq(jb, dst, 15, acc, L);
+                            break;
+                        case VEX_MUL_SHL:
+                            vex_vpsllq(jb, dst, acc, (uint8_t)k, L);
+                            break;
+                        case VEX_MUL_SHL_NEG:
+                            vex_vpsllq(jb, dst, acc, (uint8_t)k, L);
+                            vex_vpxorq(jb, 15, 15, 15, L);
+                            vex_vpsubq(jb, dst, 15, dst, L);
+                            break;
+                        case VEX_MUL_U32:
+                            vex_mul_u32(jb, dst, acc, (uint8_t)creg[i], 14, 15, L);
+                            break;
+                        case VEX_MUL_FULL:
+                            vex_mul_full(jb, acc, acc, c, L);
+                            break;
+                    }
+                    if(mask_pending && kind != VEX_MUL_FULL)
+                        vex_vpblendvb(jb, acc, acc, 14, (uint8_t)(4 + v), L);
+                }
+                mask_pending = 0;
+                break;
+            }
+            case OP_SQUARE:
+                for(int v = 0; v < 4; v++)
+                {
+                    uint8_t acc = (uint8_t)v;
+                    if(mask_pending)
+                    {
+                        vex_square(jb, 14, acc, 14, 15, L);
+                        vex_vpblendvb(jb, acc, acc, 14, (uint8_t)(4 + v), L);
+                    }
+                    else
+                        vex_square(jb, acc, acc, 14, 15, L);
+                }
+                mask_pending = 0;
+                break;
+            case OP_DIV: {
+                int64_t c = (int64_t)op->constant;
+                if(c == 1)
+                {
+                    mask_pending = 0;
+                    break;
+                }
+                int dk = 0, dneg = 0;
+                if(is_pow2_div(c, &dk, &dneg))
+                {
+                    for(int v = 0; v < 4; v++)
+                    {
+                        if(mask_pending)
+                        {
+                            vex_vmovdqa_rr(jb, 14, (uint8_t)v, L);
+                            emit_vex_pow2_div(jb, 14, dk, dneg, 15, L);
+                            vex_vpblendvb(jb, (uint8_t)v, (uint8_t)v, 14, (uint8_t)(4 + v), L);
+                        }
+                        else
+                            emit_vex_pow2_div(jb, (uint8_t)v, dk, dneg, 14, L);
+                    }
+                    mask_pending = 0;
+                    break;
+                }
+                div_magic dm_chk;
+                if(!mask_pending && compute_magic_i64(c, &dm_chk))
+                {
+                    for(int v = 0; v < 4; v++)
+                        emit_vex_magic_div(jb, (uint8_t)v, c, L);
+                    for(uint32_t j = i + 1; j < p->count; j++)
+                    {
+                        if(creg[j] < 0) continue;
+                        emit_mov_imm64(jb, 0, (uint64_t)(int64_t)p->ops[j].constant);
+                        vex_broadcast_rax(jb, (uint8_t)creg[j], L);
+                    }
+                    mask_pending = 0;
+                    break;
+                }
+                for(int v = 0; v < 4; v++)
+                    emit_vex_mem_disp(jb, 0x7F, (uint8_t)v, v * stride, L);
+                for(int v = 0; v < 4; v++)
+                {
+                    for(int lane = 0; lane < width; lane++)
+                    {
+                        uint8_t off = (uint8_t)(v * stride + lane * 8);
+                        vex_spill_load_rax(jb, off);
+                        emit_magic_div_r64_const(jb, 0 /*RAX*/, c);
+                        vex_spill_store_rax(jb, off);
+                    }
+                }
+                for(int v = 0; v < 4; v++)
+                    emit_vex_mem_disp(jb, 0x6F, (uint8_t)v, v * stride, L);
+                mask_pending = 0;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    /* Store back. (No NT variant: the kernel is in-place, and the
+       §1 analysis showed NT stores lose on cache-hot lines.) */
+    for(int v = 0; v < 4; v++)
+        emit_vex_mem_disp(jb, 0x7F, (uint8_t)v, v * stride, L);
+
+    emit_ret(jb);
+    return 1;
+
+fail:
+    munmap(jb->mem.mem, jb->mem.size);
+    return 0;
+}
+
+/* Engine wrapper: build the VEX kernel and install it (16 records
+   per call on Haswell, 8 on Ivy Bridge). */
+static int jit_compile_vex(engine *e, int is_avx2)
+{
+    jit_builder jb;
+    jb_init(&jb, 128*1024);
+    if(!jit_build_vex(&jb, &e->pipe, is_avx2))
+        return 0;   /* builder buffer already released */
+    jit_code_install(e, &jb, is_avx2 ? 16 : 8,
+                     is_avx2 ? "pxasm_jit_vex256" : "pxasm_jit_vex128");
+    return 1;
+}
+
