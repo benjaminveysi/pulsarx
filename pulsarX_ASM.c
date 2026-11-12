@@ -3326,3 +3326,308 @@ void engine_run_jit(engine *e)
     }
 }
 
+/* ============================================================
+   METAMORPHIC JIT ENGINE
+   ============================================================ */
+
+typedef struct {
+    uint64_t seed;
+    int enable_nop;
+    int enable_reg_variation;
+    int enable_instruction_swap;
+} meta_config;
+
+/* ============================================================
+   RANDOM UTILS
+   ============================================================ */
+
+static inline uint64_t meta_rand(meta_config *cfg)
+{
+    cfg->seed ^= cfg->seed << 13;
+    cfg->seed ^= cfg->seed >> 7;
+    cfg->seed ^= cfg->seed << 17;
+    return cfg->seed;
+}
+
+static inline int meta_choice(meta_config *cfg, int max)
+{
+    return meta_rand(cfg) % max;
+}
+
+/* ============================================================
+   RANDOM NOP EMISSION
+   ============================================================ */
+
+static void emit_random_nop(jit_builder *jb, meta_config *cfg)
+{
+    if(!cfg->enable_nop) return;
+
+    /* 6 choices: 4 real NOPs + 2 anti-ROP chaff variants.
+       The chaff is a real ALU op on a dead register (R8..R11, never
+       used by the scalar JIT) followed by a short JMP over trap bytes
+       that are never executed: UD2, or an incomplete EVEX prefix.
+       A linear-sweep disassembler (Angr/Triton-style) that does not
+       follow the JMP lands on the trap bytes and mis-decodes the
+       code that follows; the CPU just skips them. */
+    int n = meta_choice(cfg,6);
+
+    switch(n)
+    {
+        case 0: jb_emit8(jb,0x90); break;                 // nop
+        case 1: jb_emit8(jb,0x66); jb_emit8(jb,0x90); break;
+        case 2: jb_emit8(jb,0x0F); jb_emit8(jb,0x1F); jb_emit8(jb,0x00); break;
+        case 3: jb_emit8(jb,0x0F); jb_emit8(jb,0x1F); jb_emit8(jb,0x40); jb_emit8(jb,0x00); break; // nopl 0(%rax): 4 bytes, touches nothing (xchg eax,eax is NOT a nop -- it zero-extends EAX into RAX, destroying the upper 32 bits)
+        case 4: {
+            /* chaff: XOR dead,dead ; JMP +2 ; UD2 */
+            uint8_t d = (uint8_t)(8 + meta_choice(cfg,4));   /* R8..R11 */
+            uint8_t m = (uint8_t)(d & 7);
+            jb_emit8(jb,0x4D); jb_emit8(jb,0x31);
+            jb_emit8(jb,(uint8_t)(0xC0 | (m<<3) | m)); /* XOR Rd,Rd */
+            jb_emit8(jb,0xEB); jb_emit8(jb,0x02);       /* JMP +2 */
+            jb_emit8(jb,0x0F); jb_emit8(jb,0x0B);       /* UD2 (skipped) */
+            break;
+        }
+        case 5: {
+            /* chaff: XOR dead,dead ; JMP +3 ; incomplete EVEX prefix */
+            uint8_t d = (uint8_t)(8 + meta_choice(cfg,4));   /* R8..R11 */
+            uint8_t m = (uint8_t)(d & 7);
+            jb_emit8(jb,0x4D); jb_emit8(jb,0x31);
+            jb_emit8(jb,(uint8_t)(0xC0 | (m<<3) | m)); /* XOR Rd,Rd */
+            jb_emit8(jb,0xEB); jb_emit8(jb,0x03);       /* JMP +3 */
+            jb_emit8(jb,0x62); jb_emit8(jb,0xF1); jb_emit8(jb,0x7D);
+            break;
+        }
+    }
+}
+
+/* ============================================================
+   REGISTER VARIATION
+   ============================================================ */
+
+static uint8_t random_gp_reg(meta_config *cfg)
+{
+    /* RDI is excluded: it holds the data pointer across the whole function,
+       so using it as the working register would clobber it.
+       RBX is excluded too: it is callee-saved in the System V ABI, and the
+       emitted function has no prologue/epilogue to preserve it -- picking it
+       as the working register corrupted the caller's RBX (crash). */
+    uint8_t regs[] = {0,1,2,6}; /* RAX, RCX, RDX, RSI: all caller-saved */
+    return regs[ meta_choice(cfg,4) ];
+}
+
+/* ============================================================
+   MUTATED ADD EMISSION
+   ============================================================ */
+
+/* ============================================================
+   v5 (§10): RIVEST 2-ADIC BIJECTIVE PERMUTATION POLYNOMIALS
+   ============================================================ */
+
+static inline uint64_t pulsar_modinv_u64(uint64_t a)
+{
+    uint64_t x = a;
+    x *= 2ULL - a * x;
+    x *= 2ULL - a * x;
+    x *= 2ULL - a * x;
+    x *= 2ULL - a * x;
+    x *= 2ULL - a * x;
+    return x;
+}
+
+typedef struct {
+    uint64_t a1, a2;
+    uint64_t b1, b2;
+} rivest_bij;
+
+static inline void rivest_gen(meta_config *cfg, rivest_bij *rv)
+{
+    rv->a1 = meta_rand(cfg) | 1ULL;
+    rv->a2 = (meta_rand(cfg) | 1ULL) << 32;
+    rv->b1 = pulsar_modinv_u64(rv->a1);
+    uint64_t b1_cubed = rv->b1 * rv->b1 * rv->b1;
+    rv->b2 = -(b1_cubed * rv->a2);
+}
+
+/* Emit a high-entropy seed-diversified prologue on dead caller-saved
+   registers (R8..R11) before offset 0's load instruction so that
+   every 4-byte window at offsets 0..28 differs across seeds. */
+static void emit_meta_diversified_prologue(jit_builder *jb, meta_config *cfg)
+{
+    for(int s = 0; s < 4; s++)
+    {
+        uint64_t r = meta_rand(cfg);
+        uint8_t d = (uint8_t)(8 + ((r ^ (uint64_t)s) & 3));   /* R8..R11 */
+        uint32_t imm = (uint32_t)(r >> 17) ^ (uint32_t)(r << 9);
+        int kind = (int)((r >> 5) % 4);
+        if(kind == 0)
+        {
+            /* MOVABS Rd, imm64 (10 bytes: 2 prefix/op + 8 high-entropy bytes) */
+            jb_emit8(jb, 0x49);
+            jb_emit8(jb, (uint8_t)(0xB8 + (d & 7)));
+            jb_emit64(jb, r ^ 0xA5A5A5A55A5A5A5AULL);
+        }
+        else if(kind == 1)
+        {
+            emit_rex64(jb, d, d);
+            jb_emit8(jb, 0x8D);
+            emit_modrm(jb, 2, d, d);
+            jb_emit32(jb, imm);
+        }
+        else if(kind == 2)
+            emit_xor_r64_imm32(jb, d, (int32_t)imm);
+        else
+            emit_add_r64_imm32(jb, d, (int32_t)imm);
+    }
+}
+
+static void emit_scalar_rivest_roundtrip(jit_builder *jb, meta_config *cfg, uint8_t reg)
+{
+    rivest_bij rv;
+    rivest_gen(cfg, &rv);
+    jb_emit8(jb, 0x49); jb_emit8(jb, 0xB8); jb_emit64(jb, rv.a2);
+    emit_rex64(jb, 8, reg); jb_emit8(jb, 0x0F); jb_emit8(jb, 0xAF); emit_modrm(jb, 3, 8, reg);
+    jb_emit8(jb, 0x49); jb_emit8(jb, 0xB9); jb_emit64(jb, rv.a1);
+    emit_rex64(jb, 9, 8); jb_emit8(jb, 0x01); emit_modrm(jb, 3, 9, 8);
+    emit_rex64(jb, reg, 8); jb_emit8(jb, 0x0F); jb_emit8(jb, 0xAF); emit_modrm(jb, 3, reg, 8);
+
+    jb_emit8(jb, 0x49); jb_emit8(jb, 0xB8); jb_emit64(jb, rv.b2);
+    emit_rex64(jb, 8, reg); jb_emit8(jb, 0x0F); jb_emit8(jb, 0xAF); emit_modrm(jb, 3, 8, reg);
+    jb_emit8(jb, 0x49); jb_emit8(jb, 0xB9); jb_emit64(jb, rv.b1);
+    emit_rex64(jb, 9, 8); jb_emit8(jb, 0x01); emit_modrm(jb, 3, 9, 8);
+    emit_rex64(jb, reg, 8); jb_emit8(jb, 0x0F); jb_emit8(jb, 0xAF); emit_modrm(jb, 3, reg, 8);
+}
+
+static void emit_mutated_add(jit_builder *jb, meta_config *cfg, uint8_t reg, int64_t c)
+{
+    int variant = meta_choice(cfg, 4);
+
+    switch(variant)
+    {
+        case 0:
+            emit_alu_r64_const(jb, 0 /*add*/, reg, c);
+            break;
+
+        case 1: {
+            uint8_t scratch = (reg == 1) ? 2 : 1;
+            emit_mov_imm64(jb, scratch, (uint64_t)c);
+            emit_rex64(jb, reg, scratch);
+            jb_emit8(jb,0x01);
+            emit_modrm(jb,3,scratch,reg);
+            break;
+        }
+
+        case 2:
+            emit_alu_r64_const(jb, 0 /*add*/, reg, c/2);
+            emit_alu_r64_const(jb, 0 /*add*/, reg, c - c/2);
+            break;
+
+        case 3:
+            emit_alu_r64_const(jb, 0 /*add*/, reg, c/2);
+            emit_alu_r64_const(jb, 0 /*add*/, reg, c - c/2);
+            emit_scalar_rivest_roundtrip(jb, cfg, reg);
+            break;
+    }
+
+    emit_random_nop(jb,cfg);
+}
+
+/* ============================================================
+   MUTATED MUL EMISSION
+   ============================================================ */
+
+static void emit_mutated_mul(jit_builder *jb, meta_config *cfg, uint8_t reg, int64_t c)
+{
+    int variant = meta_choice(cfg,2);
+
+    switch(variant)
+    {
+        case 0:
+            emit_alu_r64_const(jb, 2 /*mul*/, reg, c);
+            break;
+
+        case 1: {
+            /* movabs + IMUL flavor. The old code computed IMUL RDX,reg but
+               never wrote the result back to the working register -- fixed.
+               Scratch must not alias the working reg either. */
+            uint8_t scratch = (reg == 2) ? 1 : 2;
+            emit_mov_imm64(jb, scratch, (uint64_t)c);
+            emit_rex64(jb, scratch, reg);
+            jb_emit8(jb,0x0F);
+            jb_emit8(jb,0xAF);
+            emit_modrm(jb,3,scratch,reg);    /* IMUL scratch, reg */
+            emit_rex64(jb, reg, scratch);
+            jb_emit8(jb,0x8B);
+            emit_modrm(jb,3,reg,scratch);    /* MOV reg, scratch */
+            break;
+        }
+    }
+
+    emit_random_nop(jb,cfg);
+}
+
+/* ============================================================
+   METAMORPHIC SCALAR COMPILER
+   ============================================================ */
+
+void jit_compile_meta_scalar(engine *e, meta_config *cfg)
+{
+    jit_builder jb;
+    jb_init(&jb,65536);
+
+    uint8_t working_reg = cfg->enable_reg_variation ?
+                          random_gp_reg(cfg) : 0; // default RAX
+
+    if(cfg->enable_nop)
+        emit_meta_diversified_prologue(&jb, cfg);
+
+    // MOV reg, [RDI]
+    emit_rex64(&jb, working_reg, 7);
+    jb_emit8(&jb,0x8B);
+    emit_modrm(&jb,0,working_reg,7);
+
+    for(uint32_t i=0;i<e->pipe.count;i++)
+    {
+        operator *op=&e->pipe.ops[i];
+
+        if(cfg->enable_instruction_swap && meta_choice(cfg,2))
+            emit_random_nop(&jb,cfg);
+
+        switch(op->type)
+        {
+            case OP_ADD:
+                emit_mutated_add(&jb,cfg,working_reg,(int64_t)op->constant);
+                break;
+
+            case OP_SUB:
+                emit_mutated_add(&jb,cfg,working_reg,(int64_t)(-op->constant));
+                break;
+
+            case OP_MUL:
+                emit_mutated_mul(&jb,cfg,working_reg,(int64_t)op->constant);
+                break;
+
+            case OP_SQUARE:
+                emit_imul_self(&jb,working_reg);
+                break;
+
+            case OP_DIV:
+                emit_magic_div_r64_const(&jb,working_reg,(int64_t)op->constant);
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    // MOV [RDI], reg
+    emit_rex64(&jb,working_reg,7);
+    jb_emit8(&jb,0x89);
+    emit_modrm(&jb,0,working_reg,7);
+
+    emit_ret(&jb);
+
+    char sym[64];
+    snprintf(sym, sizeof(sym), "pxasm_meta_seed_%llx", (unsigned long long)cfg->seed);
+    jit_code_install(e, &jb, 1 /*scalar width*/, sym);
+}
+
