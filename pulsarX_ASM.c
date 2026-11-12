@@ -3923,3 +3923,173 @@ static int pipeline_has_kmask(pipeline *p)
     return 0;
 }
 
+/* ============================================================
+   v5 (§10): VEX VECTOR METAMORPHIC JIT (Haswell AVX2 / Ivy Bridge AVX1)
+   ============================================================ */
+
+static int jit_compile_meta_vex(engine *e, meta_config *cfg, int is_avx2)
+{
+    if(e->pipe.count == 0)
+        return 0;
+    for(uint32_t i = 0; i < e->pipe.count; i++)
+    {
+        if(e->pipe.ops[i].type == OP_DIV)
+        {
+            int64_t c = (int64_t)e->pipe.ops[i].constant;
+            if(c == 0) return 0;
+        }
+    }
+
+    uint8_t L = is_avx2 ? 1 : 0;
+    int width = is_avx2 ? 4 : 2;
+
+    jit_builder jb;
+    jb_init(&jb, 65536);
+
+    if(cfg->enable_nop)
+        emit_meta_diversified_prologue(&jb, cfg);
+
+    uint8_t acc = (uint8_t)meta_choice(cfg, 4);
+    uint8_t cvec = 13, t1 = 14, t2 = 15;
+
+    emit_vex_mem_disp(&jb, 0x6F, acc, 0, L);
+
+    for(uint32_t i = 0; i < e->pipe.count; i++)
+    {
+        operator *op = &e->pipe.ops[i];
+        int64_t c = (int64_t)op->constant;
+
+        if(cfg->enable_instruction_swap && meta_choice(cfg, 2))
+            emit_random_nop(&jb, cfg);
+
+        switch(op->type)
+        {
+            case OP_ADD:
+            case OP_SUB: {
+                int64_t eff_c = (op->type == OP_SUB) ? (int64_t)(-(uint64_t)c) : c;
+                emit_mov_imm64(&jb, 0, (uint64_t)eff_c);
+                vex_broadcast_rax(&jb, cvec, L);
+                int var = meta_choice(cfg, 3);
+                if(var == 0)
+                    vex_vpaddq(&jb, acc, acc, cvec, L);
+                else if(var == 1)
+                {
+                    vex_vpxorq(&jb, t1, acc, cvec, L);
+                    vex_vpandq(&jb, t2, acc, cvec, L);
+                    vex_vpsllq(&jb, t2, t2, 1, L);
+                    vex_vpaddq(&jb, acc, t1, t2, L);
+                }
+                else
+                {
+                    vex_vporq(&jb, t1, acc, cvec, L);
+                    vex_vpandq(&jb, t2, acc, cvec, L);
+                    vex_vpaddq(&jb, acc, t1, t2, L);
+                }
+                emit_random_nop(&jb, cfg);
+                break;
+            }
+            case OP_MUL: {
+                int a, b;
+                if(c == 1) { emit_random_nop(&jb, cfg); break; }
+                if(c == 0) { vex_vpxorq(&jb, acc, acc, acc, L); emit_random_nop(&jb, cfg); break; }
+                if(c == -1)
+                {
+                    vex_vpxorq(&jb, t1, t1, t1, L);
+                    vex_vpsubq(&jb, acc, t1, acc, L);
+                    emit_random_nop(&jb, cfg);
+                    break;
+                }
+                if(c > 0 && decompose_shift_add(c, &a, &b))
+                {
+                    if(b < 0)
+                        vex_vpsllq(&jb, acc, acc, (uint8_t)a, L);
+                    else
+                    {
+                        vex_vpsllq(&jb, t1, acc, (uint8_t)a, L);
+                        vex_vpsllq(&jb, t2, acc, (uint8_t)b, L);
+                        vex_vpaddq(&jb, acc, t1, t2, L);
+                    }
+                    emit_random_nop(&jb, cfg);
+                    break;
+                }
+                if(c >= 0 && (uint64_t)c < (1ULL << 32))
+                {
+                    emit_mov_imm64(&jb, 0, (uint64_t)c);
+                    vex_broadcast_rax(&jb, cvec, L);
+                    vex_mul_u32(&jb, acc, acc, cvec, t1, t2, L);
+                }
+                else
+                    vex_mul_full(&jb, acc, acc, c, L);
+                emit_random_nop(&jb, cfg);
+                break;
+            }
+            case OP_SQUARE:
+                vex_square(&jb, acc, acc, t1, t2, L);
+                emit_random_nop(&jb, cfg);
+                break;
+            case OP_DIV: {
+                if(c == 1) { emit_random_nop(&jb, cfg); break; }
+                if(c == -1)
+                {
+                    vex_vpxorq(&jb, t1, t1, t1, L);
+                    vex_vpsubq(&jb, acc, t1, acc, L);
+                    emit_random_nop(&jb, cfg);
+                    break;
+                }
+                int dk = 0, dneg = 0;
+                if(is_pow2_div(c, &dk, &dneg))
+                {
+                    emit_vex_pow2_div(&jb, acc, dk, dneg, t1, L);
+                    emit_random_nop(&jb, cfg);
+                    break;
+                }
+                if(!emit_vex_magic_div(&jb, acc, c, L))
+                {
+                    munmap(jb.mem.mem, jb.mem.size);
+                    return 0;
+                }
+                emit_random_nop(&jb, cfg);
+                break;
+            }
+            default:
+                break;
+        }
+
+        if(cfg->enable_reg_variation && meta_choice(cfg, 2))
+        {
+            uint8_t next_acc = (uint8_t)meta_choice(cfg, 4);
+            if(next_acc != acc)
+            {
+                vex_vmovdqa_rr(&jb, next_acc, acc, L);
+                acc = next_acc;
+            }
+        }
+    }
+
+    emit_vex_mem_disp(&jb, 0x7F, acc, 0, L);
+    emit_ret(&jb);
+
+    char sym[64];
+    snprintf(sym, sizeof(sym), "pxasm_meta_vex%d_seed_%llx",
+             is_avx2 ? 256 : 128, (unsigned long long)cfg->seed);
+    jit_code_install(e, &jb, width, sym);
+    return 1;
+}
+
+static void jit_compile_meta(engine *e, meta_config *cfg)
+{
+    if(pipeline_has_kmask(&e->pipe))
+    {
+        engine_compile(e);
+        return;
+    }
+    if(pulsar_use_avx512() && jit_compile_meta_avx512(e, cfg))
+        return;
+    int has_avx2 = pulsar_use_avx2();
+    int has_avx  = __builtin_cpu_supports("avx");
+    if((has_avx2 || has_avx) && jit_compile_meta_vex(e, cfg, has_avx2 ? 1 : 0))
+        return;
+    jit_compile_meta_scalar(e, cfg);
+}
+
+
