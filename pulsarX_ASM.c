@@ -4384,3 +4384,168 @@ void engine_optimize_and_plan(engine *e)
     }
 }
 
+/* ============================================================
+   VECTORIZED EXECUTION ENGINE
+   ============================================================ */
+
+#define PULSAR_VECTOR_BATCH 1024
+
+typedef struct {
+    int64_t *data;
+    uint32_t size;
+} vector_batch;
+
+/* ============================================================
+   LOAD BATCH
+   ============================================================ */
+
+static inline void load_batch(vector_batch *b, int64_t *src, uint32_t n)
+{
+    b->data = src;
+    b->size = n;
+}
+
+/* ============================================================
+   VECTOR ADD
+   ============================================================ */
+
+static inline void vector_add(vector_batch *b, int64_t c)
+{
+    uint32_t i=0;
+
+#ifdef __AVX512F
+
+    __m512i vc = _mm512_set1_epi64(c);
+
+    for(; i+8<=b->size; i+=8)
+    {
+        pulsar_prefetch(&b->data[i+32]);
+
+        __m512i v = _mm512_loadu_si512(&b->data[i]);
+        v = _mm512_add_epi64(v,vc);
+        _mm512_storeu_si512(&b->data[i],v);
+    }
+
+#endif
+
+    /* Scalar tail: unsigned wraparound (same signed-overflow UB
+       as interpret() had — fixed the same way, 2026-11-12). */
+    for(;i<b->size;i++)
+        b->data[i]=(int64_t)((uint64_t)b->data[i] + (uint64_t)c);
+}
+
+/* ============================================================
+   VECTOR MUL
+   ============================================================ */
+
+static inline void vector_mul(vector_batch *b, int64_t c)
+{
+    uint32_t i=0;
+
+#ifdef __AVX512F
+
+    __m512i vc=_mm512_set1_epi64(c);
+
+    for(;i+8<=b->size;i+=8)
+    {
+        pulsar_prefetch(&b->data[i+32]);
+
+        __m512i v=_mm512_loadu_si512(&b->data[i]);
+        v=_mm512_mullo_epi64(v,vc);
+        _mm512_storeu_si512(&b->data[i],v);
+    }
+
+#endif
+
+    for(;i<b->size;i++)
+        b->data[i]=(int64_t)((uint64_t)b->data[i] * (uint64_t)c);
+}
+
+/* ============================================================
+   VECTOR SQUARE
+   ============================================================ */
+
+static inline void vector_square(vector_batch *b)
+{
+    uint32_t i=0;
+
+#ifdef __AVX512F
+
+    for(;i+8<=b->size;i+=8)
+    {
+        pulsar_prefetch(&b->data[i+32]);
+
+        __m512i v=_mm512_loadu_si512(&b->data[i]);
+        v=_mm512_mullo_epi64(v,v);
+        _mm512_storeu_si512(&b->data[i],v);
+    }
+
+#endif
+
+    for(;i<b->size;i++)
+        b->data[i]=(int64_t)((uint64_t)b->data[i] * (uint64_t)b->data[i]);
+}
+
+/* ============================================================
+   VECTOR DIV
+   ------------------------------------------------------------
+   No vector integer divide exists: scalar loop (matches the
+   spill/scalar/reload approach in simd_execute and the JITs).
+   ============================================================ */
+
+static inline void vector_div(vector_batch *b, int64_t c)
+{
+    for(uint32_t i=0;i<b->size;i++)
+        b->data[i]/=c;
+}
+
+/* ============================================================
+   EXECUTE PIPELINE (VECTOR)
+   ============================================================ */
+
+static void execute_vector_pipeline(engine *e, int64_t *data, uint32_t count)
+{
+    vector_batch b;
+
+    for(uint32_t pos=0; pos<count; pos+=PULSAR_VECTOR_BATCH)
+    {
+        uint32_t n = PULSAR_VECTOR_BATCH;
+
+        if(pos+n>count)
+            n=count-pos;
+
+        load_batch(&b,&data[pos],n);
+
+        for(uint32_t i=0;i<e->pipe.count;i++)
+        {
+            operator *op=&e->pipe.ops[i];
+
+            switch(op->type)
+            {
+                case OP_ADD:
+                    vector_add(&b,op->constant);
+                    break;
+
+                case OP_SUB:
+                    vector_add(&b,-op->constant);
+                    break;
+
+                case OP_MUL:
+                    vector_mul(&b,op->constant);
+                    break;
+
+                case OP_SQUARE:
+                    vector_square(&b);
+                    break;
+
+                case OP_DIV:
+                    vector_div(&b,(int64_t)op->constant);
+                    break;
+
+                default:
+                    break;
+            }
+        }
+    }
+}
+
