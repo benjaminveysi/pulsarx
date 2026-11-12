@@ -3172,3 +3172,157 @@ static int jit_compile_vex(engine *e, int is_avx2)
     return 1;
 }
 
+/* ============================================================
+   Dispatch: choose between scalar and AVX512 JIT
+   ============================================================ */
+
+/* §5 helper, defined with the meta JIT below. */
+static int pipeline_has_kmask(pipeline *p);
+
+void engine_compile(engine *e)
+{
+    if (pulsar_use_avx512())
+    {
+        if(jit_compile_avx512_v3(e, 0))
+        {
+            jit_compile_avx512_v3(e, 1);
+            return;
+        }
+        jit_code_nt_free(e);
+        if(pipeline_has_kmask(&e->pipe))
+            jit_compile_scalar(e);
+        else
+            jit_compile_avx512(e);
+        return;
+    }
+
+    {
+        int has_avx2 = pulsar_use_avx2();
+        int has_avx  = __builtin_cpu_supports("avx");
+        if((has_avx2 || has_avx) && jit_compile_vex(e, has_avx2 ? 1 : 0))
+            return;
+    }
+    jit_compile_scalar(e);
+}
+
+/* ============================================================
+   Run compiled JIT function
+   ============================================================ */
+
+/* ============================================================
+   STREAMING JIT DRAIN
+   ------------------------------------------------------------
+   Pops every record queued by engine_ingest() and runs the compiled
+   pipeline on it. Compiles first (once), so the function is
+   self-contained.
+
+   Width handling: the scalar kernel consumes one record's field data
+   directly (r->data). The AVX-512 kernel needs 8 contiguous int64s,
+   but ring records are arena-allocated and NOT contiguous, so full
+   groups of 8 are gathered into a stack temp, run through the kernel,
+   and scattered back; the tail (< 8) falls back to the interpreter.
+   ============================================================ */
+
+void engine_run_jit(engine *e)
+{
+    engine_compile(e);   /* ensure jit_fn/jit_width are ready */
+
+    record *r;
+
+    if(e->jit_width == 32)
+    {
+        /* v3 kernel: gather 32 records into a stack temp, run the
+           4-vector kernel on it, scatter back. The tail (< 32) goes
+           through the interpreter on its (untouched) original data. */
+        int64_t lane_val[32];
+        record *lane_rec[32];
+        int n = 0;
+
+        while((r = ring_pop(&e->queue)))
+        {
+            lane_rec[n] = r;
+            lane_val[n] = rec_get_i64(r, 0);
+            n++;
+
+            if(n == 32)
+            {
+                /* ABI: RDI = pointer to 32 packed int64s */
+                e->jit_fn((uint8_t*)lane_val, 32);
+                for(int k = 0; k < 32; k++)
+                    rec_set_i64(lane_rec[k], 0, lane_val[k]);
+                n = 0;
+            }
+            e->exec_count++;
+        }
+
+        for(int k = 0; k < n; k++)
+            interpret(e, lane_rec[k]);
+    }
+    else if(e->jit_width == 16)
+    {
+        /* v4 Haswell kernel: gather 16 records into a stack temp, run
+           the 4-vector VEX.256 kernel on it, scatter back. The tail
+           (< 16) goes through the interpreter on its original data. */
+        int64_t lane_val[16];
+        record *lane_rec[16];
+        int n = 0;
+
+        while((r = ring_pop(&e->queue)))
+        {
+            lane_rec[n] = r;
+            lane_val[n] = rec_get_i64(r, 0);
+            n++;
+
+            if(n == 16)
+            {
+                /* ABI: RDI = pointer to 16 packed int64s */
+                e->jit_fn((uint8_t*)lane_val, 16);
+                for(int k = 0; k < 16; k++)
+                    rec_set_i64(lane_rec[k], 0, lane_val[k]);
+                n = 0;
+            }
+            e->exec_count++;
+        }
+
+        for(int k = 0; k < n; k++)
+            interpret(e, lane_rec[k]);
+    }
+    else if(e->jit_width == 8)
+    {
+        int64_t lane_val[8];
+        record *lane_rec[8];
+        int n = 0;
+
+        while((r = ring_pop(&e->queue)))
+        {
+            lane_rec[n] = r;
+            lane_val[n] = rec_get_i64(r, 0);
+            n++;
+
+            if(n == 8)
+            {
+                /* ABI: RDI = pointer to 8 packed int64s */
+                e->jit_fn((uint8_t*)lane_val, 8);
+                for(int k = 0; k < 8; k++)
+                    rec_set_i64(lane_rec[k], 0, lane_val[k]);
+                n = 0;
+            }
+            e->exec_count++;
+        }
+
+        /* Tail: records were popped but never gathered; run them
+           through the interpreter on their (untouched) original data. */
+        for(int k = 0; k < n; k++)
+            interpret(e, lane_rec[k]);
+    }
+    else
+    {
+        while((r = ring_pop(&e->queue)))
+        {
+            /* ABI: RDI = r->data, not the record* */
+            e->jit_fn(r->data, 1);
+            e->exec_count++;
+        }
+    }
+}
+
