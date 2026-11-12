@@ -3631,3 +3631,295 @@ void jit_compile_meta_scalar(engine *e, meta_config *cfg)
     jit_code_install(e, &jb, 1 /*scalar width*/, sym);
 }
 
+/* ============================================================
+   VECTOR METAMORPHIC JIT (AVX-512) — §3
+   ------------------------------------------------------------
+   Same seed-driven idea as the scalar meta JIT, but on 8 packed
+   int64s in one zmm. The accumulator rotates across zmm (the EVEX
+   R/X/B/R' + vvvv/V' bits encode registers >= 8 and >= 16), and
+   each op is emitted in a mutated form:
+     ADD: direct, or an MBA identity  x+c = (x^c)+2(x&c)  or
+          x+c = (x|c)+(x&c)  (vector XOR/AND/OR + shift + ADD).
+     SUB: x-c = x+(-c), same identities (INT64_MIN falls back to a
+          direct VSUBQ, since -c would overflow).
+     MUL: c = 2^a (+2^b) becomes shift(+add), no IMUL at all
+          (3,5,9,6,10...); 0, 1, -1 are special-cased; anything
+          else falls back to a broadcast VPMULLQ.
+     DIV: magic division (broadcast constants + mulhi), pow2 shift,
+          or NEG for -1. c == 0 returns 0 so the caller falls back
+          to the scalar meta JIT (which traps via idiv).
+   Register layout (fixed, so nothing ever collides):
+     acc  : rotated per seed from {0,1,2,3,14,15,16,17,18,19,20,21,31}
+     cvec : zmm30 (broadcast constant)
+     t1/t2: zmm28/29 (MBA + shift-add temps)
+     DIV temps T = {4..13}, DIV consts C = {22..27}
+   ============================================================ */
+
+/* Broadcast an int64 constant into a zmm (via RAX, which the vector
+   JIT never uses as a working register). */
+static inline void emit_broadcast_i64(jit_builder *jb, uint8_t dst, int64_t c)
+{
+    emit_mov_imm64(jb, 0, (uint64_t)c);   /* RAX = c */
+    emit_vpbroadcastq(jb, dst, 0);        /* dst = broadcast(RAX) */
+}
+
+/* Mutated vector ADD: acc += c. */
+static void emit_evex_rivest_roundtrip(jit_builder *jb, meta_config *cfg,
+                                       uint8_t acc, uint8_t cvec, uint8_t t1)
+{
+    rivest_bij rv;
+    rivest_gen(cfg, &rv);
+    emit_broadcast_i64(jb, cvec, (int64_t)rv.a2);
+    emit_vpmullq(jb, t1, acc, cvec, 0);
+    emit_broadcast_i64(jb, cvec, (int64_t)rv.a1);
+    emit_vpaddq(jb, t1, t1, cvec, 0);
+    emit_vpmullq(jb, acc, acc, t1, 0);
+
+    emit_broadcast_i64(jb, cvec, (int64_t)rv.b2);
+    emit_vpmullq(jb, t1, acc, cvec, 0);
+    emit_broadcast_i64(jb, cvec, (int64_t)rv.b1);
+    emit_vpaddq(jb, t1, t1, cvec, 0);
+    emit_vpmullq(jb, acc, acc, t1, 0);
+}
+
+static void emit_meta_vpaddq(jit_builder *jb, meta_config *cfg, uint8_t acc,
+                             int64_t c, uint8_t cvec, uint8_t t1, uint8_t t2)
+{
+    int variant = meta_choice(cfg, 4);
+    emit_broadcast_i64(jb, cvec, c);
+    switch(variant)
+    {
+        case 0:  /* direct */
+            emit_vpaddq(jb, acc, acc, cvec, 0);
+            break;
+        case 1:  /* x+c = (x^c) + 2*(x&c) */
+            emit_vpxorq(jb, t1, acc, cvec, 0);
+            emit_vpandq(jb, t2, acc, cvec, 0);
+            emit_vpsllq(jb, t2, t2, 1);
+            emit_vpaddq(jb, acc, t1, t2, 0);
+            break;
+        case 2:  /* x+c = (x|c) + (x&c) */
+            emit_vporq(jb, t1, acc, cvec, 0);
+            emit_vpandq(jb, t2, acc, cvec, 0);
+            emit_vpaddq(jb, acc, t1, t2, 0);
+            break;
+        case 3:  /* v5 (§10): Non-linear Rivest Polynomial MBA */
+            emit_vpxorq(jb, t1, acc, cvec, 0);
+            emit_vpandq(jb, t2, acc, cvec, 0);
+            emit_vpsllq(jb, t2, t2, 1);
+            emit_vpaddq(jb, acc, t1, t2, 0);
+            emit_evex_rivest_roundtrip(jb, cfg, acc, cvec, t1);
+            break;
+    }
+    emit_random_nop(jb,cfg);
+}
+
+/* Mutated vector SUB: acc -= c (== acc += -c; INT64_MIN is direct). */
+static void emit_meta_vpsubq(jit_builder *jb, meta_config *cfg, uint8_t acc,
+                             int64_t c, uint8_t cvec, uint8_t t1, uint8_t t2)
+{
+    if(c == INT64_MIN)
+    {
+        emit_broadcast_i64(jb, cvec, c);
+        emit_vpsubq(jb, acc, acc, cvec, 0);
+        emit_random_nop(jb,cfg);
+        return;
+    }
+    emit_meta_vpaddq(jb, cfg, acc, -c, cvec, t1, t2);
+}
+
+/* 1 if c == 2^a (+2^b): a single power (b=-1) or a sum of two. */
+static int decompose_shift_add(int64_t c, int *a, int *b)
+{
+    if(c <= 0) return 0;
+    uint64_t u = (uint64_t)c;
+    int bits = __builtin_popcountll(u);
+    if(bits > 2) return 0;
+    if(bits == 1)
+    {
+        *a = __builtin_ctzll(u);
+        *b = -1;
+        return 1;
+    }
+    int lo = __builtin_ctzll(u);
+    u &= u - 1;   /* clear the lowest set bit */
+    *a = __builtin_ctzll(u);
+    *b = lo;
+    return 1;
+}
+
+/* Mutated vector MUL: acc *= c. */
+static void emit_meta_vpmul(jit_builder *jb, meta_config *cfg, uint8_t acc,
+                            int64_t c, uint8_t cvec, uint8_t t1, uint8_t t2)
+{
+    int a, b;
+    if(c == 1)
+    {
+        emit_random_nop(jb,cfg);   /* x*1 = x */
+        return;
+    }
+    if(c == 0)
+    {
+        emit_vpxorq(jb, acc, acc, acc, 0);
+        emit_random_nop(jb,cfg);
+        return;
+    }
+    if(c == -1)
+    {
+        emit_vpxorq(jb, t1, t1, t1, 0);   /* t1 = 0 */
+        emit_vpsubq(jb, acc, t1, acc, 0);  /* acc = -acc */
+        emit_random_nop(jb,cfg);
+        return;
+    }
+    if(c > 0 && decompose_shift_add(c, &a, &b))
+    {
+        if(b < 0)
+            emit_vpsllq(jb, acc, acc, (uint8_t)a);      /* x << a */
+        else
+        {
+            emit_vpsllq(jb, t1, acc, (uint8_t)a);       /* t1 = x<<a */
+            emit_vpsllq(jb, t2, acc, (uint8_t)b);       /* t2 = x<<b */
+            emit_vpaddq(jb, acc, t1, t2, 0);            /* acc = t1+t2 */
+        }
+        emit_random_nop(jb,cfg);
+        return;
+    }
+    /* Not decomposable: broadcast + VPMULLQ. */
+    emit_broadcast_i64(jb, cvec, c);
+    emit_vpmullq(jb, acc, acc, cvec, 0);
+    emit_random_nop(jb,cfg);
+}
+
+/* Mutated vector DIV: acc /= c. Returns 0 when the caller should fall
+   back to the scalar meta JIT (c == 0, or an unrepresentable magic). */
+static int emit_meta_vpdiv(jit_builder *jb, meta_config *cfg, uint8_t acc,
+                           int64_t c, const uint8_t *T, const uint8_t *C)
+{
+    if(c == 1)
+    {
+        emit_random_nop(jb,cfg);
+        return 1;
+    }
+    if(c == 0)
+        return 0;
+    if(c == -1)
+    {
+        emit_vpxorq(jb, T[0], T[0], T[0], 0);
+        emit_vpsubq(jb, acc, T[0], acc, 0);
+        emit_random_nop(jb,cfg);
+        return 1;
+    }
+    int dk, dneg;
+    if(is_pow2_div(c, &dk, &dneg))
+    {
+        emit_evex_pow2_div(jb, acc, dk, dneg, T[0]);
+        emit_random_nop(jb,cfg);
+        return 1;
+    }
+    div_magic dm;
+    if(!compute_magic_i64(c, &dm))
+        return 0;
+    emit_mov_imm64(jb, 0, dm.magic & 0xFFFFFFFFULL);
+    emit_vpbroadcastq(jb, C[0], 0);
+    emit_mov_imm64(jb, 0, dm.magic >> 32);
+    emit_vpbroadcastq(jb, C[1], 0);
+    emit_mov_imm64(jb, 0, 0xFFFFFFFFULL);
+    emit_vpbroadcastq(jb, C[2], 0);
+    emit_mov_imm64(jb, 0, 1ULL << 32);
+    emit_vpbroadcastq(jb, C[3], 0);
+    emit_mov_imm64(jb, 0, 0x8000000000000000ULL);
+    emit_vpbroadcastq(jb, C[4], 0);
+    emit_mov_imm64(jb, 0, 0xFFFFFFFFFFFFFFFFULL);
+    emit_vpbroadcastq(jb, C[5], 0);
+    emit_evex_magic_div(jb, acc, c, T, C);
+    emit_random_nop(jb,cfg);
+    return 1;
+}
+
+/* Vector metamorphic compiler. Returns 1 on success, 0 when the
+   pipeline needs the scalar meta JIT (a DIV by 0). */
+static int jit_compile_meta_avx512(engine *e, meta_config *cfg)
+{
+    if(e->pipe.count == 0)
+        return 0;
+
+    /* A DIV by 0 has no vector form (it must trap via idiv). */
+    for(uint32_t i = 0; i < e->pipe.count; i++)
+        if(e->pipe.ops[i].type == OP_DIV && (int64_t)e->pipe.ops[i].constant == 0)
+            return 0;
+
+    jit_builder jb;
+    jb_init(&jb, 65536);
+
+    /* Accumulator, rotated per seed (exercises the EVEX high-bit
+       encoding); the pool avoids every reserved register. */
+    uint8_t acc_pool[] = {0,1,2,3,14,15,16,17,18,19,20,21,31};
+    uint8_t acc = acc_pool[meta_choice(cfg, (int)(sizeof(acc_pool)))];
+    uint8_t cvec = 30, t1 = 28, t2 = 29;
+    uint8_t T[10] = {4,5,6,7,8,9,10,11,12,13};   /* DIV temps */
+    uint8_t C[6]  = {22,23,24,25,26,27};          /* DIV consts */
+
+    /* v5 (§10): Diversify prologue offsets 0..28 before the initial EVEX load. */
+    if(cfg->enable_nop)
+        emit_meta_diversified_prologue(&jb, cfg);
+
+    /* Load [RDI] into acc (8 packed int64s). */
+    emit_evex_mem(&jb, 0x6F, 2 /*F3*/, 1, acc);
+
+    for(uint32_t i = 0; i < e->pipe.count; i++)
+    {
+        operator *op = &e->pipe.ops[i];
+
+        if(cfg->enable_instruction_swap && meta_choice(cfg,2))
+            emit_random_nop(&jb,cfg);
+
+        switch(op->type)
+        {
+            case OP_ADD:
+                emit_meta_vpaddq(&jb,cfg,acc,(int64_t)op->constant,cvec,t1,t2);
+                break;
+            case OP_SUB:
+                emit_meta_vpsubq(&jb,cfg,acc,(int64_t)op->constant,cvec,t1,t2);
+                break;
+            case OP_MUL:
+                emit_meta_vpmul(&jb,cfg,acc,(int64_t)op->constant,cvec,t1,t2);
+                break;
+            case OP_SQUARE:
+                emit_vpmullq(&jb,acc,acc,acc,0);
+                emit_random_nop(&jb,cfg);
+                break;
+            case OP_DIV:
+                if(!emit_meta_vpdiv(&jb,cfg,acc,(int64_t)op->constant,T,C))
+                    return 0;   /* cannot happen; be safe */
+                break;
+            default:
+                break;
+        }
+    }
+
+    /* Store acc back to [RDI]. */
+    emit_evex_mem(&jb, 0x7F, 2 /*F3*/, 1, acc);
+
+    emit_ret(&jb);
+
+    char sym[64];
+    snprintf(sym, sizeof(sym), "pxasm_meta_seed_%llx", (unsigned long long)cfg->seed);
+    jit_code_install(e, &jb, 8 /*8 packed int64s*/, sym);
+    return 1;
+}
+
+/* Metamorphic dispatch: vector when AVX-512 is present, else scalar.
+   Falls back to scalar when the vector form does not apply (DIV by 0).
+   §5: pipelines with k-mask ops do not get metamorphism — the meta
+   JITs do not implement the predicate, so compile the regular JIT
+   instead (which does). The strategy still runs it as EXEC_META_JIT,
+   just without mutation. */
+static int pipeline_has_kmask(pipeline *p)
+{
+    for(uint32_t i = 0; i < p->count; i++)
+        if(p->ops[i].type == OP_CMP_GT || p->ops[i].type == OP_SELECT ||
+           p->ops[i].type == OP_BIT_XOR)
+            return 1;
+    return 0;
+}
+
