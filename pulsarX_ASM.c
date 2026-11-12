@@ -4093,3 +4093,294 @@ static void jit_compile_meta(engine *e, meta_config *cfg)
 }
 
 
+/* ============================================================
+   PIPELINE OPTIMIZER & QUERY PLANNER
+   ============================================================ */
+
+/*
+   Concept:
+   --------
+   Pipeline اولیه:
+      ADD 5
+      ADD 3
+      MUL 2
+      SQUARE
+      MUL 1
+      SUB 0
+
+   Fuse → Canonical Form:
+      ((x + 8) * 2)^2
+*/
+
+/* ============================================================
+   DEAD OP ELIMINATION
+   ============================================================ */
+
+static void pipeline_eliminate_dead(pipeline *p)
+{
+    operator *dst = p->ops;
+    uint32_t new_count = 0;
+
+    for(uint32_t i=0;i<p->count;i++)
+    {
+        operator *op=&p->ops[i];
+
+        if(op->type==OP_ADD && op->constant==0) continue;
+        if(op->type==OP_SUB && op->constant==0) continue;
+        if(op->type==OP_MUL && op->constant==1) continue;
+
+        dst[new_count++] = *op;
+    }
+
+    p->count = new_count;
+}
+
+/* ============================================================
+   PIPELINE FUSION (order-preserving)
+   ------------------------------------------------------------
+   Merges only strictly consecutive ADD/SUB runs (into one ADD) and
+   consecutive MUL runs (into one MUL). SQUARE, DIV and anything else
+   are barriers: they are preserved in place, in order.
+
+   (The previous version accumulated all ADDs/MULs across the whole
+   pipeline and re-emitted them in canonical order -- which silently
+   dropped OP_DIV and miscompiled non-canonical orders, e.g. MUL 2,
+   ADD 5 became (x+5)*2 instead of x*2+5.)
+   ============================================================ */
+
+static void pipeline_fuse(pipeline *p)
+{
+    operator out[PULSAR_MAX_PIPE];
+    uint32_t n = 0;
+
+    int64_t acc = 0;
+    int acc_kind = 0;   /* 0 = none, 1 = ADD-run, 2 = MUL-run */
+
+    for(uint32_t i = 0; i < p->count; i++)
+    {
+        operator *op = &p->ops[i];
+
+        if(op->type == OP_ADD || op->type == OP_SUB)
+        {
+            int64_t c = (int64_t)op->constant;
+            if(op->type == OP_SUB)
+                c = -c;
+            if(acc_kind == 1)
+            {
+                acc += c;
+                continue;
+            }
+            if(acc_kind == 2 && acc != 1)   /* flush pending MUL run */
+            {
+                operator m;
+                m.type = OP_MUL; m.field = 0; m.constant = (double)acc;
+                out[n++] = m;
+            }
+            acc_kind = 1;
+            acc = c;
+        }
+        else if(op->type == OP_MUL)
+        {
+            int64_t c = (int64_t)op->constant;
+            if(acc_kind == 2)
+            {
+                acc *= c;
+                continue;
+            }
+            if(acc_kind == 1 && acc != 0)   /* flush pending ADD run */
+            {
+                operator a;
+                a.type = OP_ADD; a.field = 0; a.constant = (double)acc;
+                out[n++] = a;
+            }
+            acc_kind = 2;
+            acc = c;
+        }
+        else
+        {
+            /* barrier: flush, then preserve the op as-is, in order */
+            if(acc_kind == 1 && acc != 0)
+            {
+                operator a;
+                a.type = OP_ADD; a.field = 0; a.constant = (double)acc;
+                out[n++] = a;
+            }
+            else if(acc_kind == 2 && acc != 1)
+            {
+                operator m;
+                m.type = OP_MUL; m.field = 0; m.constant = (double)acc;
+                out[n++] = m;
+            }
+            acc_kind = 0;
+            out[n++] = *op;
+        }
+    }
+
+    if(acc_kind == 1 && acc != 0)
+    {
+        operator a;
+        a.type = OP_ADD; a.field = 0; a.constant = (double)acc;
+        out[n++] = a;
+    }
+    else if(acc_kind == 2 && acc != 1)
+    {
+        operator m;
+        m.type = OP_MUL; m.field = 0; m.constant = (double)acc;
+        out[n++] = m;
+    }
+
+    memcpy(p->ops, out, n * sizeof(operator));
+    p->count = n;
+}
+
+/* ============================================================
+   COST MODEL
+   ============================================================ */
+
+typedef struct {
+    uint64_t cost_scalar;
+    uint64_t cost_simd;
+    uint64_t cost_jit;
+} cost_model;
+
+static cost_model estimate_cost(engine *e)
+{
+    cost_model c = {0};
+
+    for(uint32_t i=0;i<e->pipe.count;i++)
+    {
+        operator *op=&e->pipe.ops[i];
+
+        switch(op->type)
+        {
+            case OP_ADD:
+            case OP_SUB:
+                c.cost_scalar += 1;
+                c.cost_simd   += 1;
+                c.cost_jit    += 1;
+                break;
+
+            case OP_MUL:
+                c.cost_scalar += 3;
+                c.cost_simd   += 2;
+                c.cost_jit    += 2;
+                break;
+
+            case OP_SQUARE:
+                c.cost_scalar += 4;
+                c.cost_simd   += 2;
+                c.cost_jit    += 1;
+                break;
+
+            case OP_DIV:
+                /* idiv is slow everywhere; SIMD/JIT spill to scalar lanes */
+                c.cost_scalar += 30;
+                c.cost_simd   += 40;
+                c.cost_jit    += 20;
+                break;
+
+            case OP_CMP_GT:
+                /* vector compare -> k-mask; scalar compare + set */
+                c.cost_scalar += 2;
+                c.cost_simd   += 2;
+                c.cost_jit    += 2;
+                break;
+
+            case OP_SELECT:
+                /* masked move (pred ? c : v) */
+                c.cost_scalar += 2;
+                c.cost_simd   += 2;
+                c.cost_jit    += 2;
+                break;
+
+            case OP_BIT_XOR:
+                /* masked xor */
+                c.cost_scalar += 2;
+                c.cost_simd   += 2;
+                c.cost_jit    += 2;
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    // JIT amortization
+    c.cost_jit += 50;
+
+    return c;
+}
+
+/* ============================================================
+   EXECUTION STRATEGY
+   ============================================================ */
+
+typedef enum {
+    EXEC_SCALAR,
+    EXEC_SIMD,
+    EXEC_JIT,
+    EXEC_META_JIT,
+    EXEC_TRACE_JIT
+} exec_strategy;
+
+static exec_strategy choose_strategy(engine *e)
+{
+    cost_model c = estimate_cost(e);
+
+    if(e->exec_count > PULSAR_JIT_THRESHOLD)
+    {
+        if(e->pipe.count > 1)
+            return EXEC_META_JIT;
+        return EXEC_JIT;
+    }
+
+    if(c.cost_simd < c.cost_scalar)
+        return EXEC_SIMD;
+
+    return EXEC_SCALAR;
+}
+
+/* ============================================================
+   PLANNER ENTRY
+   ============================================================ */
+
+void engine_optimize_and_plan(engine *e)
+{
+    // Phase 1: dead ops
+    pipeline_eliminate_dead(&e->pipe);
+
+    // Phase 2: fusion
+    pipeline_fuse(&e->pipe);
+
+    // Phase 3: decide execution
+    exec_strategy s = choose_strategy(e);
+
+    switch(s)
+    {
+        case EXEC_META_JIT: {
+            uint64_t rng_state = 0x9E3779B97F4A7C15ULL;
+            meta_config cfg = {
+                .seed = pulsar_rng(&rng_state),
+                .enable_nop = 1,
+                .enable_reg_variation = 1,
+                .enable_instruction_swap = 1
+            };
+            jit_compile_meta(e,&cfg);
+            break;
+        }
+
+        case EXEC_JIT:
+            engine_compile(e);
+            break;
+
+        case EXEC_SIMD:
+            // nothing to compile
+            break;
+
+        case EXEC_SCALAR:
+        default:
+            // interpreter fallback
+            break;
+    }
+}
+
