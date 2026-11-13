@@ -4968,3 +4968,313 @@ static inline uint64_t pulsar_rdtscp_cycles(jit_fn_t fn, int width)
     return best;
 }
 
+/* ============================================================
+   COMPILE TRACE (real, §4 + v5 §7/§8/§11)
+   ============================================================ */
+
+static void trace_free_code(trace_node *t)
+{
+    if(t->code_valid)
+    {
+        munmap(t->code.mem, t->code.size);
+        t->code_valid = 0;
+        t->fn = NULL;
+        t->code_start = NULL;
+        t->width = 0;
+    }
+}
+
+static void compile_trace(engine *e, trace_node *t)
+{
+    trace_free_code(t);
+    t->fn = NULL;
+    t->width = 0;
+    t->code_start = NULL;
+
+    for(uint32_t i = 0; i < e->pipe.count && i < MAX_TRACE_LEN; i++)
+    {
+        t->compiled_ops[i] = e->pipe.ops[i].type;
+        t->compiled_consts[i] = e->pipe.ops[i].constant;
+    }
+    t->len = e->pipe.count;
+
+    poly_t poly;
+    memset(&poly, 0, sizeof(poly));
+    int has_poly = (pipeline_to_poly(&e->pipe, &poly) == 0);
+
+    if(pulsar_use_avx512())
+    {
+        jit_builder jb_poly, jb_v3;
+        int ok_poly = 0, ok_v3 = 0;
+
+        if(has_poly)
+        {
+            jb_init(&jb_poly, 128*1024);
+            ok_poly = jit_build_estrin_avx512(&jb_poly, &poly);
+            if(!ok_poly) munmap(jb_poly.mem.mem, jb_poly.mem.size);
+        }
+        jb_init(&jb_v3, 128*1024);
+        ok_v3 = jit_build_avx512_v3(&jb_v3, &e->pipe, 0);
+
+        if(ok_poly && ok_v3)
+        {
+            pulsar_mpk_lock();
+            uint64_t cyc_poly = pulsar_rdtscp_cycles((jit_fn_t)jb_poly.mem.mem, 32);
+            uint64_t cyc_v3   = pulsar_rdtscp_cycles((jit_fn_t)jb_v3.mem.mem, 32);
+            if(cyc_poly <= cyc_v3 || (uint32_t)poly.degree < e->pipe.count)
+            {
+                munmap(jb_v3.mem.mem, jb_v3.mem.size);
+                t->code = jb_poly.mem;
+                t->code_valid = 1;
+                t->fn = (jit_fn_t)jb_poly.mem.mem;
+                t->code_start = (void*)t->fn;
+                t->width = 32;
+                return;
+            }
+            else
+            {
+                munmap(jb_poly.mem.mem, jb_poly.mem.size);
+                t->code = jb_v3.mem;
+                t->code_valid = 1;
+                t->fn = (jit_fn_t)jb_v3.mem.mem;
+                t->code_start = (void*)t->fn;
+                t->width = 32;
+                return;
+            }
+        }
+        else if(ok_poly)
+        {
+            pulsar_mpk_lock();
+            t->code = jb_poly.mem;
+            t->code_valid = 1;
+            t->fn = (jit_fn_t)jb_poly.mem.mem;
+            t->code_start = (void*)t->fn;
+            t->width = 32;
+            return;
+        }
+        else if(ok_v3)
+        {
+            pulsar_mpk_lock();
+            t->code = jb_v3.mem;
+            t->code_valid = 1;
+            t->fn = (jit_fn_t)jb_v3.mem.mem;
+            t->code_start = (void*)t->fn;
+            t->width = 32;
+            return;
+        }
+        return;
+    }
+
+    {
+        int has_avx2 = pulsar_use_avx2();
+        int has_avx  = __builtin_cpu_supports("avx");
+        if(has_avx2 || has_avx)
+        {
+            int is_avx2 = has_avx2 ? 1 : 0;
+            int w = is_avx2 ? 16 : 8;
+            jit_builder jb_poly, jb_vex;
+            int ok_poly = 0, ok_vex = 0;
+
+            if(has_poly)
+            {
+                jb_init(&jb_poly, 128*1024);
+                ok_poly = jit_build_poly_vex(&jb_poly, &poly, is_avx2);
+                if(!ok_poly) munmap(jb_poly.mem.mem, jb_poly.mem.size);
+            }
+            jb_init(&jb_vex, 128*1024);
+            ok_vex = jit_build_vex(&jb_vex, &e->pipe, is_avx2);
+
+            if(ok_poly && ok_vex)
+            {
+                pulsar_mpk_lock();
+                uint64_t cyc_poly = pulsar_rdtscp_cycles((jit_fn_t)jb_poly.mem.mem, w);
+                uint64_t cyc_vex  = pulsar_rdtscp_cycles((jit_fn_t)jb_vex.mem.mem, w);
+                if(cyc_poly <= cyc_vex && (uint32_t)poly.degree < e->pipe.count)
+                {
+                    munmap(jb_vex.mem.mem, jb_vex.mem.size);
+                    t->code = jb_poly.mem;
+                    t->code_valid = 1;
+                    t->fn = (jit_fn_t)jb_poly.mem.mem;
+                    t->code_start = (void*)t->fn;
+                    t->width = w;
+                    return;
+                }
+                else
+                {
+                    munmap(jb_poly.mem.mem, jb_poly.mem.size);
+                    t->code = jb_vex.mem;
+                    t->code_valid = 1;
+                    t->fn = (jit_fn_t)jb_vex.mem.mem;
+                    t->code_start = (void*)t->fn;
+                    t->width = w;
+                    return;
+                }
+            }
+            else if(ok_poly)
+            {
+                pulsar_mpk_lock();
+                t->code = jb_poly.mem;
+                t->code_valid = 1;
+                t->fn = (jit_fn_t)jb_poly.mem.mem;
+                t->code_start = (void*)t->fn;
+                t->width = w;
+                return;
+            }
+            else if(ok_vex)
+            {
+                pulsar_mpk_lock();
+                t->code = jb_vex.mem;
+                t->code_valid = 1;
+                t->fn = (jit_fn_t)jb_vex.mem.mem;
+                t->code_start = (void*)t->fn;
+                t->width = w;
+                return;
+            }
+        }
+    }
+}
+
+/* ============================================================
+   FIND OR COMPILE TRACE
+   ============================================================ */
+
+static trace_node *get_or_compile_trace(engine *e)
+{
+    uint64_t hash = hash_trace(e->pipe.ops, e->pipe.count);
+
+    // Check cache: a hash hit counts only when the stored ops match
+    // (trace_ops_match) — a bare hash collision must never return
+    // another pipeline's compiled trace.
+    for (uint32_t i = 0; i < trace_count; ++i) {
+        if (trace_cache[i].hash == hash &&
+            trace_ops_match(&trace_cache[i], e->pipe.ops, e->pipe.count)) {
+            trace_cache[i].exec_count++;
+            // Potentially re-compile if underlying ops changed or for specialization
+            // if (needs_recompile(trace_cache[i])) { ... }
+            return &trace_cache[i];
+        }
+    }
+
+    // Compile new trace if cache not full
+    if (trace_count < TRACE_CACHE_SIZE) {
+        trace_node *new_trace = &trace_cache[trace_count];
+        new_trace->hash = hash;
+        compile_trace(e, new_trace);
+        new_trace->exec_count = 1;
+        trace_count++;
+        return new_trace;
+    }
+
+    // Cache full: replace the least-used slot (slot 0 here).
+    trace_node *replace_trace = &trace_cache[0];
+    replace_trace->exec_count++; // Incrementing to simulate it being used now
+    replace_trace->hash = hash;
+    compile_trace(e, replace_trace);
+    replace_trace->exec_count = 1; // Reset count for the new trace
+    return replace_trace;
+}
+
+/* ============================================================
+   RUNTIME SPECIALIZATION (SIMULATED)
+   ============================================================ */
+
+// In a real system, this would involve analyzing the compiled trace's behavior
+// and potentially recompiling it with specialized instructions or constants.
+// Example: If a constant is always 0, optimize related instructions.
+static void specialize_trace(trace_node *trace)
+{
+    if (trace->exec_count > 1000 && trace->len > 1) {
+        // Simulate specialization: e.g., replace generic ops with faster ones if possible
+        // For this example, we just log it.
+        // printf("Specializing trace %p (hash: %lu)\n", trace->code_start, trace->hash);
+    }
+}
+
+/* ============================================================
+   EXECUTE TRACE JIT
+   ============================================================ */
+
+/* Resolve (or compile) the trace for the current pipeline. Serial-only:
+   the global trace cache is mutated here, so parallel execution resolves
+   once up front and hands the resulting trace_node to every thread. */
+static trace_node *trace_resolve(engine *e)
+{
+    trace_node *trace = get_or_compile_trace(e);
+    specialize_trace(trace);
+    return trace;
+}
+
+/* Execute an already-resolved trace over [data, data+count). Thread-safe:
+   reads only the trace and the (post-planning, read-only) pipeline, and
+   writes a disjoint slice of the array. */
+static void execute_trace_chunk(trace_node *trace, engine *e,
+                                int64_t *data, uint32_t count)
+{
+    /* --- Real JIT path (§4): the trace owns compiled machine code.
+           Horner (width 8), the v3 kernel (width 32), or the v4
+           VEX kernel (width 16/8). A tail that
+           does not fill a vector goes through the interpreter. --- */
+    if(trace->fn)
+    {
+        uint32_t w = (uint32_t)trace->width;
+        uint32_t i = 0;
+        for(; i + w <= count; i += w)
+            trace->fn((uint8_t*)&data[i], w);
+        for(; i < count; i++)
+        {
+            record r;
+            r.data = (uint8_t*)&data[i];
+            interpret(e, &r);
+        }
+        return;
+    }
+
+    /* --- Simulation fallback (no JIT for this pipeline: DIV by 0 or
+           too many constants). Applies the trace ops with intrinsics.
+           K-mask ops are not vectorised here: fall back to the
+           interpreter (which implements the predicate exactly). --- */
+    if(pipeline_has_kmask(&e->pipe))
+    {
+        for(uint32_t i = 0; i < count; i++)
+        {
+            record r;
+            r.data = (uint8_t*)&data[i];
+            interpret(e, &r);
+        }
+        return;
+    }
+    for (uint32_t batch_pos = 0; batch_pos < count; batch_pos += PULSAR_VECTOR_BATCH) {
+        uint32_t n = PULSAR_VECTOR_BATCH;
+        if (batch_pos + n > count) {
+            n = count - batch_pos;
+        }
+        vector_batch b;
+        load_batch(&b, &data[batch_pos], n);
+
+        /* Iterate the live pipeline, not trace->compiled_ops: the
+           snapshot array holds only MAX_TRACE_LEN (16) entries, so
+           a longer pipeline whose JIT failed would read past it
+           (pre-existing OOB, fixed 2026-11-12 alongside the v4
+           trace-cache work). The constants already came from
+           e->pipe.ops here; the types do now too. */
+        for (uint32_t op_idx = 0; op_idx < e->pipe.count; ++op_idx) {
+            uint8_t op_type = (uint8_t)e->pipe.ops[op_idx].type;
+            // Re-use logic from execute_vector_pipeline, but applied to the trace ops
+            switch (op_type) {
+                case OP_ADD: vector_add(&b, e->pipe.ops[op_idx].constant); break;
+                case OP_SUB: vector_add(&b, -e->pipe.ops[op_idx].constant); break;
+                case OP_MUL: vector_mul(&b, e->pipe.ops[op_idx].constant); break;
+                case OP_SQUARE: vector_square(&b); break;
+                case OP_DIV: vector_div(&b, (int64_t)e->pipe.ops[op_idx].constant); break;
+                default: break;
+            }
+        }
+    }
+}
+
+static void execute_trace_jit(engine *e, int64_t *data, uint32_t count)
+{
+    trace_node *trace = trace_resolve(e);
+    execute_trace_chunk(trace, e, data, count);
+}
+
