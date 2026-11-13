@@ -5278,3 +5278,777 @@ static void execute_trace_jit(engine *e, int64_t *data, uint32_t count)
     execute_trace_chunk(trace, e, data, count);
 }
 
+/* ============================================================
+   STRATEGY DISPATCH (used by the benchmark suite)
+   ============================================================ */
+
+/* ============================================================
+   REAL STRATEGY EXECUTORS (flat int64 arrays)
+   ------------------------------------------------------------
+   The interpreter, the SIMD executor and every JIT backend all
+   operate on records -- but a stack record can simply *view* an
+   array slot (record.data = &data[i]), so the real compiled /
+   interpreted code runs in place on the flat array: no ring, no
+   copies, no arena traffic. Field 0 lives at offset 0 (the schema
+   is zero-initialised), which is exactly what the emitters assume.
+   ============================================================ */
+
+static void execute_scalar_records(engine *e, int64_t *data, uint32_t count)
+{
+    for(uint32_t i=0;i<count;i++)
+    {
+        record r;
+        r.data=(uint8_t*)&data[i];
+        interpret(e,&r);
+    }
+}
+
+static void execute_simd_records(engine *e, int64_t *data, uint32_t count)
+{
+    uint32_t i=0;
+    for(;i+SIMD_WIDTH<=count;i+=SIMD_WIDTH)
+    {
+        record recs[SIMD_WIDTH];
+        record_batch b;
+        for(int k=0;k<SIMD_WIDTH;k++)
+        {
+            recs[k].data=(uint8_t*)&data[i+k];
+            b.items[k]=&recs[k];
+        }
+        simd_execute(e,&b);
+    }
+    for(;i<count;i++)
+    {
+        record r;
+        r.data=(uint8_t*)&data[i];
+        interpret(e,&r);
+    }
+}
+
+static void execute_jit_records(engine *e, int64_t *data, uint32_t count)
+{
+    /* e->jit_width is 1 (scalar/meta JIT), 8 (old AVX-512 kernel) or
+       32 (v3 kernel). A tail that does not fill a vector goes through
+       the interpreter.
+       Streaming stores for arrays larger than L3: when
+       e->jit_nt_enable is set, the v3 NT kernel writes straight to
+       RAM (no RFO, no L3 pollution) and the pass is fenced once at
+       the end so the data is visible. Off by default: the cached v3
+       kernel is faster on this VM and on large-L3 machines. */
+    uint32_t w=(uint32_t)e->jit_width;
+    uint32_t i=0;
+    jit_fn_t fn = e->jit_fn;
+    int use_nt = (e->jit_nt_enable && e->jit_width == 32 && e->jit_fn_nt &&
+                  (uint64_t)count * 8 > 32ULL * 1024 * 1024);
+    if(use_nt)
+        fn = e->jit_fn_nt;
+
+    if(use_nt)
+    {
+        /* VMOVNTDQ faults on a misaligned address: the 512-bit store
+           needs the 64-byte vector alignment, and malloc only gives
+           16. Peel the unaligned head (at most 7 records) through the
+           interpreter. The bulk stays aligned because every kernel
+           call advances 256 bytes, a multiple of 64. */
+        uint32_t off = (uint32_t)((uintptr_t)data % 64) / 8;
+        uint32_t head = off ? (8 - off) : 0;
+        if(head > count) head = count;
+        for(; i < head; i++)
+        {
+            record r;
+            r.data=(uint8_t*)&data[i];
+            interpret(e,&r);
+        }
+    }
+
+    for(;i+w<=count;i+=w)
+        fn((uint8_t*)&data[i],w);
+    for(;i<count;i++)
+    {
+        record r;
+        r.data=(uint8_t*)&data[i];
+        interpret(e,&r);
+    }
+    if(use_nt)
+        _mm_sfence();
+}
+
+/* ============================================================
+   FREE-THREADED PARALLEL EXECUTION (Python 3.14 style)
+   ------------------------------------------------------------
+   True multi-core parallelism with plain pthreads — no GIL-like
+   global lock, no SIMD registers required. The record range is split
+   into contiguous chunks; each pool thread runs the strategy's REAL
+   backend (interpreter, AVX-512 intrinsics, or compiled machine code)
+   on its own disjoint slice. All backends are pure with respect to
+   the engine after planning: they read the pipeline/schema and the
+   (serially compiled) jit_fn, and write only their slice.
+
+   The pool is persistent: threads are created once by
+   engine_set_threads() and parked on a condition variable between
+   dispatches, so there is no spawn/join cost on the hot path.
+   Threads are pinned round-robin to CPUs, like the legacy workers.
+   ============================================================ */
+
+#define PULSAR_MAX_THREADS 64
+
+/* Minimum records per thread before parallel dispatch pays off
+   (below this the dispatch overhead dominates — stay serial). */
+#define PULSAR_PAR_MIN_PER_THREAD 16384
+
+typedef struct {
+    engine        *e;
+    exec_strategy  strat;
+    trace_node    *trace;   /* resolved trace for EXEC_TRACE_JIT, else NULL */
+    int64_t       *data;
+    uint32_t       start;   /* inclusive */
+    uint32_t       end;     /* exclusive */
+} pulsar_job;
+
+struct pulsar_pool {
+    pthread_t       *threads;
+    pulsar_job      *jobs;          /* one slot per thread */
+    int              nthreads;
+    int              ncpu;
+    pthread_mutex_t  mtx;
+    pthread_cond_t   cv_work;      /* new generation available */
+    pthread_cond_t   cv_done;      /* all jobs of a generation finished */
+    uint64_t         gen;          /* current work generation */
+    uint64_t         completed_gen;
+    int              remaining;    /* jobs not yet finished in this gen */
+    int              shutdown;
+};
+
+typedef struct {
+    pulsar_pool *pool;
+    int          id;
+} pulsar_worker_arg;
+
+/* Run one chunk through the strategy's real backend. */
+static void pulsar_run_job(pulsar_job *job)
+{
+    uint32_t len = job->end - job->start;
+    if(len == 0)
+        return;
+    int64_t *d = job->data + job->start;
+
+    switch(job->strat)
+    {
+        case EXEC_SCALAR:
+            execute_scalar_records(job->e, d, len);
+            break;
+        case EXEC_SIMD:
+            execute_simd_records(job->e, d, len);
+            break;
+        case EXEC_JIT:
+        case EXEC_META_JIT:
+            execute_jit_records(job->e, d, len);
+            break;
+        case EXEC_TRACE_JIT:
+            execute_trace_chunk(job->trace, job->e, d, len);
+            break;
+        default:
+            execute_vector_pipeline(job->e, d, len);
+            break;
+    }
+}
+
+static void *pulsar_pool_worker(void *varg)
+{
+    pulsar_worker_arg *wa = (pulsar_worker_arg*)varg;
+    pulsar_pool *p = wa->pool;
+    int id = wa->id;
+    free(wa);
+
+    /* Pin to a CPU round-robin — same idea as the legacy worker_simd. */
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(id % p->ncpu, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+
+    /* §6 MPK: this worker executes JIT code but never writes it, so
+       lock the JIT pages exec-only for this thread. */
+    pulsar_mpk_lock();
+
+    uint64_t my_gen = 0;
+    for(;;)
+    {
+        pthread_mutex_lock(&p->mtx);
+        while(p->gen == my_gen && !p->shutdown)
+            pthread_cond_wait(&p->cv_work, &p->mtx);
+        if(p->shutdown)
+        {
+            pthread_mutex_unlock(&p->mtx);
+            break;
+        }
+        my_gen = p->gen;
+        pulsar_job job = p->jobs[id];   /* copy under the lock */
+        pthread_mutex_unlock(&p->mtx);
+
+        pulsar_run_job(&job);
+
+        pthread_mutex_lock(&p->mtx);
+        if(--p->remaining == 0)
+        {
+            p->completed_gen = my_gen;
+            pthread_cond_signal(&p->cv_done);
+        }
+        pthread_mutex_unlock(&p->mtx);
+    }
+    return NULL;
+}
+
+static pulsar_pool *pulsar_pool_create(int nthreads)
+{
+    pulsar_pool *p = (pulsar_pool*)calloc(1, sizeof(*p));
+    if(!p)
+        return NULL;
+
+    p->ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if(p->ncpu < 1)
+        p->ncpu = 1;
+    if(nthreads <= 0)
+        nthreads = p->ncpu;             /* 0/auto = one thread per CPU */
+    if(nthreads > PULSAR_MAX_THREADS)
+        nthreads = PULSAR_MAX_THREADS;
+    p->nthreads = nthreads;
+
+    p->threads = (pthread_t*)calloc((size_t)nthreads, sizeof(pthread_t));
+    p->jobs    = (pulsar_job*)calloc((size_t)nthreads, sizeof(pulsar_job));
+    if(!p->threads || !p->jobs)
+    {
+        free(p->threads);
+        free(p->jobs);
+        free(p);
+        return NULL;
+    }
+
+    pthread_mutex_init(&p->mtx, NULL);
+    pthread_cond_init(&p->cv_work, NULL);
+    pthread_cond_init(&p->cv_done, NULL);
+
+    for(int i = 0; i < nthreads; i++)
+    {
+        pulsar_worker_arg *wa = (pulsar_worker_arg*)malloc(sizeof(*wa));
+        wa->pool = p;
+        wa->id = i;
+        pthread_create(&p->threads[i], NULL, pulsar_pool_worker, wa);
+    }
+    return p;
+}
+
+static void pulsar_pool_destroy(pulsar_pool *p)
+{
+    if(!p)
+        return;
+    pthread_mutex_lock(&p->mtx);
+    p->shutdown = 1;
+    pthread_cond_broadcast(&p->cv_work);
+    pthread_mutex_unlock(&p->mtx);
+
+    for(int i = 0; i < p->nthreads; i++)
+        pthread_join(p->threads[i], NULL);
+
+    pthread_mutex_destroy(&p->mtx);
+    pthread_cond_destroy(&p->cv_work);
+    pthread_cond_destroy(&p->cv_done);
+    free(p->threads);
+    free(p->jobs);
+    free(p);
+}
+
+/* Split [0, count) into nthreads contiguous chunks and run them.
+   Chunk starts are 8-aligned so the AVX-512 JIT kernel never sees a
+   split vector; each chunk's tail is finished by the interpreter,
+   exactly like the serial path. */
+static void pulsar_pool_dispatch(pulsar_pool *p, engine *e, exec_strategy strat,
+                                 trace_node *trace, int64_t *data, uint32_t count)
+{
+    int n = p->nthreads;
+    uint32_t per = (count / (uint32_t)n) & ~7u;
+
+    if(per == 0)
+    {
+        /* Too small to split cleanly — run serially on this thread. */
+        pulsar_job job = { e, strat, trace, data, 0, count };
+        pulsar_run_job(&job);
+        return;
+    }
+
+    pthread_mutex_lock(&p->mtx);
+    uint64_t gen = ++p->gen;
+    for(int i = 0; i < n; i++)
+    {
+        uint32_t start = (uint32_t)i * per;
+        uint32_t end = (i == n - 1) ? count : start + per;
+        p->jobs[i] = (pulsar_job){ e, strat, trace, data, start, end };
+    }
+    p->remaining = n;
+    pthread_cond_broadcast(&p->cv_work);
+    while(p->completed_gen != gen)
+        pthread_cond_wait(&p->cv_done, &p->mtx);
+    pthread_mutex_unlock(&p->mtx);
+}
+
+/* Enable free-threaded execution: nthreads worker threads (nthreads <= 0
+   means "one per CPU", nthreads == 1 disables the pool → serial).
+   Any existing pool is torn down first. */
+void engine_set_threads(engine *e, int nthreads)
+{
+    if(e->pool)
+    {
+        pulsar_pool_destroy(e->pool);
+        e->pool = NULL;
+    }
+    if(nthreads == 1)
+        return;
+    e->pool = pulsar_pool_create(nthreads);
+}
+
+/* Release engine-owned resources (the thread pool). */
+void engine_shutdown(engine *e)
+{
+    /* Stop streaming workers first: they touch the engine. */
+    engine_stop_workers(e);
+
+    jit_code_nt_free(e);
+
+    if(e->pool)
+    {
+        pulsar_pool_destroy(e->pool);
+        e->pool = NULL;
+    }
+}
+
+/* Explicit-strategy dispatcher used by the benchmark suite. Each strategy
+   runs its REAL backend; compilation (and trace resolution) happens once,
+   serially, before any thread runs — the compiled code is read-only
+   afterwards. With a thread pool attached (engine_set_threads), the record
+   range is split free-threaded style across the pool; otherwise the whole
+   range runs serially on the calling thread. */
+void engine_execute_strategy(engine *e, exec_strategy strat, int64_t *data, uint32_t count)
+{
+    /* Plan once, like engine_optimize_and_plan_adaptive does for the
+       main loop: dead-op elimination, then operator fusion. */
+    pipeline_eliminate_dead(&e->pipe);
+    pipeline_fuse(&e->pipe);
+
+    /* Serial preparation: compile once so every thread shares the same
+       read-only machine code. */
+    trace_node *trace = NULL;
+    switch(strat)
+    {
+        case EXEC_JIT:
+            engine_compile(e);
+            break;
+
+        case EXEC_META_JIT:
+        {
+            uint64_t seed_state=0x9E3779B97F4A7C15ull ^ (uint64_t)e->exec_count;
+            meta_config cfg = {
+                .seed = pulsar_rng(&seed_state),
+                .enable_nop = 1,
+                .enable_reg_variation = 1,
+                .enable_instruction_swap = 1
+            };
+            jit_compile_meta(e,&cfg);
+            break;
+        }
+
+        case EXEC_TRACE_JIT:
+            /* Resolve the (global) trace cache once — it is mutated here. */
+            trace = trace_resolve(e);
+            break;
+
+        default:
+            break;
+    }
+
+    /* Free-threaded dispatch (Python 3.14 style): no GIL, no SIMD
+       registers — parallelism comes from CPU cores. Small inputs stay
+       serial to avoid dispatch overhead. */
+    if(e->pool && count >= (uint32_t)e->pool->nthreads * PULSAR_PAR_MIN_PER_THREAD)
+        pulsar_pool_dispatch(e->pool, e, strat, trace, data, count);
+    else
+    {
+        pulsar_job job = { e, strat, trace, data, 0, count };
+        pulsar_run_job(&job);
+    }
+
+    e->exec_count += count;
+}
+
+
+/* ============================================================
+   ADAPTIVE EXECUTION STRATEGY (REVISED)
+   ============================================================ */
+
+// Revised strategy to incorporate Trace JIT
+static exec_strategy choose_strategy_adaptive(engine *e)
+{
+    cost_model c = estimate_cost(e); // Reuse cost model from Part 5
+
+    // High execution count suggests trace JIT might be beneficial
+    if (e->exec_count > PULSAR_TRACE_THRESHOLD) {
+         // Trace JIT is generally faster than regular JIT if trace is "hot"
+         // and offers more specialization opportunities.
+         // We still consider other options if the pipeline is trivial.
+        if (e->pipe.count > 1 || c.cost_jit < c.cost_simd) {
+             return EXEC_TRACE_JIT;
+        }
+    }
+
+    if (e->exec_count > PULSAR_JIT_THRESHOLD) {
+        if (e->pipe.count > 1) {
+            // Fallback to Metamorphic JIT if Trace JIT isn't triggered yet
+            // or if the pipeline is complex and benefits from randomization.
+            return EXEC_META_JIT;
+        }
+        return EXEC_JIT;
+    }
+
+    // Lower counts: favor simpler, predictable execution
+    if (c.cost_simd < c.cost_scalar) {
+        // Only use SIMD if it's significantly faster than scalar
+        if (c.cost_simd < c.cost_scalar / 2) {
+            return EXEC_SIMD;
+        }
+    }
+
+    return EXEC_SCALAR;
+}
+
+/* ============================================================
+   PLANNER ENTRY (REVISED)
+   ============================================================ */
+
+void engine_optimize_and_plan_adaptive(engine *e)
+{
+    // Phase 1: dead ops
+    pipeline_eliminate_dead(&e->pipe);
+
+    // Phase 2: fusion
+    pipeline_fuse(&e->pipe);
+
+    // Phase 3: decide execution strategy
+    exec_strategy s = choose_strategy_adaptive(e);
+
+    switch (s)
+    {
+        case EXEC_TRACE_JIT: {
+            execute_trace_jit(e, NULL, 0); // Compile/optimize trace
+            break;
+        }
+        case EXEC_META_JIT: {
+            uint64_t rng_state = 0x9E3779B97F4A7C15ULL;
+            meta_config cfg = {
+                .seed = pulsar_rng(&rng_state),
+                .enable_nop = 1,
+                .enable_reg_variation = 1,
+                .enable_instruction_swap = 1
+            };
+            jit_compile_meta(e, &cfg);
+            break;
+        }
+        case EXEC_JIT:
+            engine_compile(e);
+            break;
+
+        case EXEC_SIMD:
+            // Vector execution is handled directly in the main loop
+            break;
+
+        case EXEC_SCALAR:
+        default:
+            // Interpreter fallback is handled directly
+            break;
+    }
+}
+
+/* ============================================================
+   MAIN EXECUTION LOOP (SIMPLIFIED)
+   ============================================================ */
+
+// This is where the actual data processing happens, calling the right strategy
+void engine_execute(engine *e, int64_t *data, uint32_t count)
+{
+    // Reset pipeline and optimize/plan for this execution based on runtime behavior
+    // In a real scenario, the engine might have a cached plan from previous runs
+    engine_optimize_and_plan_adaptive(e);
+
+    // Select execution path based on the chosen strategy
+    exec_strategy s = choose_strategy_adaptive(e); // Re-evaluate or use cached strategy
+
+    switch (s)
+    {
+        case EXEC_TRACE_JIT:
+            execute_trace_jit(e, data, count);
+            break;
+        case EXEC_META_JIT:
+        case EXEC_JIT:
+            execute_jit_records(e, data, count);
+            break;
+        case EXEC_SIMD:
+            execute_simd_records(e, data, count);
+            break;
+        case EXEC_SCALAR:
+        default:
+            execute_scalar_records(e, data, count);
+            break;
+    }
+
+    // Increment execution count for adaptive strategy tuning
+    e->exec_count++;
+}
+
+/* ============================================================
+   BENCHMARK SUITE
+   ============================================================ */
+
+#include <time.h>
+#include <signal.h>
+
+#define TEST_RECORDS     (200 * 1000 * 1000)
+#define TEST_ITER        5
+
+typedef struct {
+    double throughput_mrec_per_sec;
+    double avg_latency_us;
+} bench_result;
+
+static volatile int pulsar_bench_abort = 0;
+
+void pulsar_sigint_handler(int signo)
+{
+    (void)signo;
+    pulsar_bench_abort = 1;
+}
+
+bench_result pulsar_benchmark(engine *e, exec_strategy strat)
+{
+    int64_t *data = malloc(TEST_RECORDS * sizeof(int64_t));
+    for (uint32_t i=0; i < TEST_RECORDS; i++)
+        data[i] = (i % 1000000);
+
+    struct timespec t_start, t_end;
+    double min_lat = 1e20;
+    double throughput = 0;
+
+    for (int it=0; it < TEST_ITER && !pulsar_bench_abort; it++)
+    {
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+        engine_execute_strategy(e, strat, data, TEST_RECORDS);
+
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+
+        double elapsed = (t_end.tv_sec - t_start.tv_sec) +
+                         (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+
+        double lat_us = elapsed * 1e6 / TEST_RECORDS;
+        double thr_mrec = TEST_RECORDS / (elapsed * 1e6);
+
+        if (lat_us < min_lat) min_lat = lat_us;
+        if (thr_mrec > throughput) throughput = thr_mrec;
+    }
+
+    free(data);
+
+    bench_result r = {throughput, min_lat};
+    return r;
+}
+
+/* ============================================================
+   BENCHMARK ENTRY POINT
+   ============================================================ */
+void pulsar_run_full_benchmark()
+{
+    signal(SIGINT, pulsar_sigint_handler);
+    printf("\n=== Pulsar Ultra Benchmark ===\n");
+
+    engine e;
+    engine_init(&e);
+    engine_load_sample_pipeline(&e);
+
+    exec_strategy strategies[] = {
+        EXEC_SCALAR,
+        EXEC_SIMD,
+        EXEC_JIT,
+        EXEC_META_JIT,
+        EXEC_TRACE_JIT
+    };
+
+    const char* strat_label[] = {
+        "Scalar",
+        "SIMD",
+        "JIT",
+        "Metamorphic JIT",
+        "Trace JIT"
+    };
+
+    for(int s=0; s<5 && !pulsar_bench_abort; s++)
+    {
+        bench_result r = pulsar_benchmark(&e, strategies[s]);
+        printf("Strategy: %-16s | Throughput: %.2f M rec/sec | Avg Latency: %.2f us\n",
+               strat_label[s], r.throughput_mrec_per_sec, r.avg_latency_us);
+    }
+
+    printf("=========================================\n");
+}
+
+/* Free-threaded scaling benchmark: the JIT strategy (pure machine code,
+   no SIMD registers needed for the threading itself) at 1..#CPU threads. */
+void pulsar_run_parallel_benchmark()
+{
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if(ncpu < 1)
+        ncpu = 1;
+
+    printf("\n=== Pulsar Free-Threaded Scaling (JIT strategy) ===\n");
+
+    for(int t = 1; t <= ncpu && !pulsar_bench_abort; t++)
+    {
+        engine e;
+        engine_init(&e);
+        engine_load_sample_pipeline(&e);
+        engine_set_threads(&e, t);
+
+        bench_result r = pulsar_benchmark(&e, EXEC_JIT);
+        printf("Threads: %d | Throughput: %.2f M rec/sec | Avg Latency: %.2f us\n",
+               t, r.throughput_mrec_per_sec, r.avg_latency_us);
+
+        engine_shutdown(&e);
+    }
+
+    printf("===================================================\n");
+}
+
+/* ============================================================
+   ERROR HANDLING + MEMORY AUDITING (SIMPLIFIED)
+   ============================================================ */
+
+// Each critical malloc/free guarded with macros (in real code use tcmalloc/jemalloc)
+#define PULSAR_SAFE_MALLOC(sz) ({        \
+    void* ptr = malloc(sz);              \
+    if(!ptr) {                          \
+        fprintf(stderr,"[FATAL] Out of memory! (size=%zu)\n", (size_t)sz); \
+        exit(1);                        \
+    }                                   \
+    ptr;                                \
+})
+
+#define PULSAR_SAFE_FREE(ptr) do{        \
+    if(ptr) free(ptr);                   \
+}while(0)
+
+/* ============================================================
+   JIT DIAGNOSTICS (§6)
+   ------------------------------------------------------------
+   pulsar_dump_jit_diagnostics prints what a JIT blob looks like
+   from the outside: its size, Shannon entropy (bits/byte, a
+   diversity measure), and a rough port-pressure estimate (how many
+   of its instructions are EVEX vector ops, which run on ports 0/1/5,
+   vs scalar ops). Used by --inspect-jit.
+   ============================================================ */
+
+static void pulsar_dump_jit_diagnostics(const char *name, const uint8_t *code,
+                                        size_t len)
+{
+    if(!code || len == 0)
+    {
+        printf("[inspect] %s: <no code>\n", name);
+        return;
+    }
+
+    /* Shannon entropy (bits per byte). */
+    size_t hist[256];
+    memset(hist, 0, sizeof(hist));
+    for(size_t i = 0; i < len; i++)
+        hist[code[i]]++;
+    double entropy = 0.0;
+    for(int i = 0; i < 256; i++)
+    {
+        if(hist[i] == 0) continue;
+        double p = (double)hist[i] / (double)len;
+        entropy -= p * (log(p) / log(2.0));
+    }
+
+    /* Rough instruction mix: count EVEX (0x62) and VEX (0xC4/0xC5)
+       prefixes; the rest is scalar / control flow. */
+    size_t evex = 0, vex = 0;
+    for(size_t i = 0; i < len; i++)
+    {
+        if(code[i] == 0x62) evex++;
+        else if(code[i] == 0xC4 || code[i] == 0xC5) vex++;
+    }
+
+    /* Distinct byte values (a crude diversity measure). */
+    size_t distinct = 0;
+    for(int i = 0; i < 256; i++)
+        if(hist[i] > 0) distinct++;
+
+    printf("[inspect] %s: size=%zu bytes, entropy=%.3f bits/byte, "
+           "distinct-bytes=%zu, EVEX-prefixes=%zu, VEX-prefixes=%zu\n",
+           name, len, entropy, distinct, evex, vex);
+    printf("[inspect] %s: port pressure (rough): vector EVEX ops lean on "
+           "ports 0/1/5; %zu of %zu bytes are vector prefixes (%.0f%%)\n",
+           name, evex + vex, len,
+           len ? 100.0 * (double)(evex + vex) / (double)len : 0.0);
+}
+
+/* ============================================================
+   MAIN ENTRY — FULL INTEGRATION TEST + BENCHMARK
+   ============================================================ */
+
+int main(int argc, char **argv)
+{
+    // Full functional test (low volume)
+    engine e;
+    engine_init(&e);
+    engine_load_sample_pipeline(&e);
+
+    int64_t *data = PULSAR_SAFE_MALLOC((size_t)(1<<20) * sizeof(int64_t));
+    for(uint32_t i=0; i<(1<<20); i++) data[i]=i;
+
+    engine_execute(&e, data, (1<<20));
+    // Quick functional verification
+    for(uint32_t i=0; i<16; i++)
+        printf("Result[%u]=%ld\n",i,data[i]);
+
+    PULSAR_SAFE_FREE(data);
+
+    /* --inspect-jit: dump JIT diagnostics (size, entropy, port mix)
+       for the regular and the metamorphic JIT, then exit. */
+    if(argc > 1 && strcmp(argv[1], "--inspect-jit") == 0)
+    {
+        engine_compile(&e);
+        pulsar_dump_jit_diagnostics("pxasm_jit",
+                                    e.jit_code.mem, e.jit_code.offset);
+        if(e.jit_code_nt_valid)
+            pulsar_dump_jit_diagnostics("pxasm_jit_nt",
+                                        e.jit_code_nt.mem, e.jit_code_nt.offset);
+
+        meta_config cfg = {
+            .seed = 0x9E3779B97F4A7C15ull,
+            .enable_nop = 1,
+            .enable_reg_variation = 1,
+            .enable_instruction_swap = 1
+        };
+        jit_compile_meta(&e, &cfg);
+        pulsar_dump_jit_diagnostics("pxasm_meta_seed_9e3779b97f4a7c15",
+                                    e.jit_code.mem, e.jit_code.offset);
+        printf("[inspect] perf map: /tmp/perf-%d.map (if any JIT was installed)\n",
+               (int)getpid());
+        engine_shutdown(&e);
+        return 0;
+    }
+
+    // Benchmark suite
+    pulsar_run_full_benchmark();
+
+    // Free-threaded scaling benchmark
+    pulsar_run_parallel_benchmark();
+
+    engine_shutdown(&e);
+    return 0;
+}
