@@ -4908,3 +4908,63 @@ typedef struct {
 static trace_node trace_cache[TRACE_CACHE_SIZE];
 static uint32_t trace_count = 0;
 
+/* ============================================================
+   TRACE HASHING
+   ============================================================ */
+
+/* Trace hash. Integer-only mixing: hashing the constants as
+   doubles was a bug once — two different constants, same hash. */
+static uint64_t hash_trace(operator *ops, uint32_t count)
+{
+    uint64_t hash = 5381;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t cb;
+        double cd = ops[i].constant;
+        memcpy(&cb, &cd, sizeof(cb));
+        hash = ((hash << 5) + hash) + (uint64_t)ops[i].type;
+        hash = ((hash << 5) + hash) + cb;
+        hash ^= hash >> 29;
+        hash *= 0xbf58476d1ce4e5b9ULL;
+        hash ^= hash >> 32;
+    }
+    return hash;
+}
+
+static int trace_ops_match(trace_node *t, operator *ops, uint32_t count)
+{
+    if(t->len != count || count > MAX_TRACE_LEN) return 0;
+    for(uint32_t i = 0; i < count; i++)
+    {
+        if(t->compiled_ops[i] != (uint8_t)ops[i].type) return 0;
+        if(t->compiled_consts[i] != ops[i].constant) return 0;
+    }
+    return 1;
+}
+
+/* ============================================================
+   v5 (§11): ONLINE RDTSCP MULTI-ARMED BANDIT PROBE
+   ============================================================ */
+
+static inline uint64_t pulsar_rdtscp_cycles(jit_fn_t fn, int width)
+{
+    int64_t buf[64] __attribute__((aligned(64)));
+    for(int i = 0; i < 64; i++) buf[i] = (int64_t)(i + 1);
+
+    for(int w = 0; w < 2; w++)
+        for(int i = 0; i + width <= 64; i += width)
+            fn((uint8_t*)&buf[i], (uint64_t)width);
+
+    uint64_t best = (uint64_t)-1;
+    for(int rep = 0; rep < 5; rep++)
+    {
+        unsigned int aux = 0;
+        uint64_t t0 = __rdtscp(&aux);
+        for(int i = 0; i + width <= 64; i += width)
+            fn((uint8_t*)&buf[i], (uint64_t)width);
+        uint64_t t1 = __rdtscp(&aux);
+        uint64_t dt = t1 - t0;
+        if(dt < best) best = dt;
+    }
+    return best;
+}
+
