@@ -4549,3 +4549,362 @@ static void execute_vector_pipeline(engine *e, int64_t *data, uint32_t count)
     }
 }
 
+/* ============================================================
+   TRACE-BASED JIT COMPILATION
+   ============================================================ */
+
+/*
+   Concept:
+   --------
+   Instead of compiling the entire pipeline upfront, we compile "traces"
+   of execution. A trace is a sequence of operations that are frequently
+   executed together. This allows for more aggressive optimizations as
+   we know the runtime behavior.
+
+   Example:
+      If the pipeline is: ADD 5, MUL 2, SQUARE
+      And we often see the sequence ADD -> MUL executed, we compile that trace.
+      If SQUARE is less frequent or has different inputs, it might be a fallback.
+*/
+
+#define MAX_TRACE_LEN 16
+#define TRACE_CACHE_SIZE 1024
+
+/* ============================================================
+   v5 (§7, §8, §11): KEMPNER 2-ADIC IDEAL REDUCTION, ESTRIN
+   TREE-PARALLEL JIT & ONLINE RDTSCP BANDIT AUTOTUNER
+   ============================================================ */
+
+#define POLY_MAX_DEGREE 65
+#define POLY_CONV_CAP   130
+
+typedef struct {
+    uint64_t coeff[POLY_MAX_DEGREE + 1];  /* coeff[i] = coefficient of x^i */
+    int degree;                           /* highest nonzero index (<= 65) */
+} poly_t;
+
+static uint64_t kempner_stirling[POLY_CONV_CAP + 1][POLY_CONV_CAP + 1];
+static int kempner_stirling_ready = 0;
+
+static void kempner_init_table(void)
+{
+    if(__atomic_load_n(&kempner_stirling_ready, __ATOMIC_ACQUIRE))
+        return;
+    memset(kempner_stirling, 0, sizeof(kempner_stirling));
+    kempner_stirling[0][0] = 1ULL;
+    for(int m = 1; m <= POLY_CONV_CAP; m++)
+    {
+        uint64_t c = (uint64_t)(m - 1);
+        kempner_stirling[m][0] = -c * kempner_stirling[m - 1][0];
+        for(int i = 1; i <= m; i++)
+            kempner_stirling[m][i] = kempner_stirling[m - 1][i - 1]
+                                   - c * kempner_stirling[m - 1][i];
+    }
+    __atomic_store_n(&kempner_stirling_ready, 1, __ATOMIC_RELEASE);
+}
+
+static void poly_kempner_reduce_buf(uint64_t *nc, int max_deg)
+{
+    kempner_init_table();
+    for(int k = max_deg; k >= 2; k--)
+    {
+        uint64_t c = nc[k];
+        if(c == 0) continue;
+        int v2 = k - __builtin_popcount((unsigned int)k);
+        if(v2 >= 64)
+        {
+            for(int i = 0; i < k; i++)
+                nc[i] -= c * kempner_stirling[k][i];
+            nc[k] = 0;
+        }
+        else
+        {
+            int ek = 64 - v2;
+            uint64_t mask = (1ULL << ek) - 1ULL;
+            uint64_t q = c & ~mask;
+            if(q != 0)
+            {
+                for(int i = 0; i < k; i++)
+                    nc[i] -= q * kempner_stirling[k][i];
+                nc[k] = c & mask;
+            }
+        }
+    }
+}
+
+static void poly_normalize(poly_t *p)
+{
+    poly_kempner_reduce_buf(p->coeff, p->degree > POLY_MAX_DEGREE ? POLY_MAX_DEGREE : p->degree);
+    int d = POLY_MAX_DEGREE;
+    while(d > 0 && p->coeff[d] == 0) d--;
+    p->degree = d;
+}
+
+static void poly_init_identity(poly_t *p)
+{
+    for(int i = 0; i <= POLY_MAX_DEGREE; i++) p->coeff[i] = 0;
+    p->coeff[1] = 1;
+    p->degree = 1;
+}
+
+static void poly_add_const(poly_t *p, uint64_t c) { p->coeff[0] += c; }
+static void poly_sub_const(poly_t *p, uint64_t c) { p->coeff[0] -= c; }
+
+static void poly_mul_const(poly_t *p, uint64_t c)
+{
+    for(int i = 0; i <= p->degree; i++)
+        p->coeff[i] *= c;
+    poly_normalize(p);
+}
+
+static int poly_square(poly_t *p)
+{
+    int nd = 2 * p->degree;
+    if(nd > POLY_CONV_CAP) nd = POLY_CONV_CAP;
+    uint64_t nc[POLY_CONV_CAP + 1];
+    memset(nc, 0, sizeof(nc));
+    for(int i = 0; i <= p->degree; i++)
+    {
+        if(p->coeff[i] == 0) continue;
+        for(int j = 0; j <= p->degree; j++)
+            nc[i + j] += p->coeff[i] * p->coeff[j];
+    }
+    poly_kempner_reduce_buf(nc, nd);
+    for(int i = 0; i <= POLY_MAX_DEGREE; i++)
+        p->coeff[i] = nc[i];
+    p->degree = POLY_MAX_DEGREE;
+    poly_normalize(p);
+    return 1;
+}
+
+static int pipeline_to_poly(pipeline *pl, poly_t *out)
+{
+    poly_t p;
+    poly_init_identity(&p);
+    for(uint32_t i = 0; i < pl->count; i++)
+    {
+        operator *op = &pl->ops[i];
+        switch(op->type)
+        {
+            case OP_ADD: poly_add_const(&p, (uint64_t)(int64_t)op->constant); break;
+            case OP_SUB: poly_sub_const(&p, (uint64_t)(int64_t)op->constant); break;
+            case OP_MUL: poly_mul_const(&p, (uint64_t)(int64_t)op->constant); break;
+            case OP_SQUARE:
+                poly_square(&p);
+                break;
+            default: return -1;
+        }
+    }
+    poly_normalize(&p);
+    *out = p;
+    return 0;
+}
+
+static inline uint64_t poly_eval_u64(const poly_t *p, uint64_t x)
+{
+    uint64_t acc = p->coeff[p->degree];
+    for(int i = p->degree - 1; i >= 0; i--)
+        acc = acc * x + p->coeff[i];
+    return acc;
+}
+
+__attribute__((unused))
+static int poly_horner_worth_it(poly_t *p, uint32_t nops, uint32_t nconst)
+{
+    (void)nconst;
+    return (uint32_t)p->degree <= nops;
+}
+
+static int jit_build_estrin_avx512(jit_builder *jb, poly_t *p)
+{
+    int d = p->degree;
+    if(d < 0 || d > POLY_MAX_DEGREE) return 0;
+
+    int pin_all = (d <= 15);
+    if(pin_all)
+    {
+        for(int i = 0; i <= d; i++)
+        {
+            emit_mov_imm64(jb, 0, p->coeff[i]);
+            emit_vpbroadcastq(jb, (uint8_t)(16 + i), 0);
+        }
+    }
+
+    for(int v = 0; v < 4; v++)
+        emit_evex_mem_disp(jb, 0x6F, 2 /*F3*/, 1, (uint8_t)v, v * 64);
+
+    if(d == 0)
+    {
+        for(int v = 0; v < 4; v++)
+            emit_vmovdqa64_rr(jb, (uint8_t)v, 16);
+    }
+    else if(d == 1)
+    {
+        for(int v = 0; v < 4; v++)
+        {
+            emit_vpmullq(jb, (uint8_t)v, (uint8_t)v, 17, 0);
+            emit_vpaddq(jb, (uint8_t)v, (uint8_t)v, 16, 0);
+        }
+    }
+    else
+    {
+        for(int v = 0; v < 4; v++)
+            emit_vpmullq(jb, (uint8_t)(4 + v), (uint8_t)v, (uint8_t)v, 0);
+
+        int max_even = (d % 2 == 0) ? d : (d - 1);
+        int max_odd  = (d % 2 == 1) ? d : (d - 1);
+
+        if(pin_all)
+        {
+            for(int v = 0; v < 4; v++)
+            {
+                emit_vmovdqa64_rr(jb, (uint8_t)(8 + v), (uint8_t)(16 + max_even));
+                emit_vmovdqa64_rr(jb, (uint8_t)(12 + v), (uint8_t)(16 + max_odd));
+            }
+        }
+        else
+        {
+            emit_mov_imm64(jb, 0, p->coeff[max_even]);
+            emit_vpbroadcastq(jb, 30, 0);
+            emit_mov_imm64(jb, 0, p->coeff[max_odd]);
+            emit_vpbroadcastq(jb, 31, 0);
+            for(int v = 0; v < 4; v++)
+            {
+                emit_vmovdqa64_rr(jb, (uint8_t)(8 + v), 30);
+                emit_vmovdqa64_rr(jb, (uint8_t)(12 + v), 31);
+            }
+        }
+
+        int k = max_odd;
+        if(max_even > max_odd)
+        {
+            int even_next = max_even - 2;
+            uint8_t ce_reg = 30;
+            if(pin_all)
+                ce_reg = (uint8_t)(16 + even_next);
+            else
+            {
+                emit_mov_imm64(jb, 0, p->coeff[even_next]);
+                emit_vpbroadcastq(jb, 30, 0);
+            }
+            for(int v = 0; v < 4; v++)
+            {
+                emit_vpmullq(jb, (uint8_t)(8 + v), (uint8_t)(8 + v), (uint8_t)(4 + v), 0);
+                emit_vpaddq(jb, (uint8_t)(8 + v), (uint8_t)(8 + v), ce_reg, 0);
+            }
+        }
+
+        for(int odd_idx = k - 2; odd_idx >= 1; odd_idx -= 2)
+        {
+            int even_idx = odd_idx - 1;
+            uint8_t ce_reg = 30, co_reg = 31;
+            if(pin_all)
+            {
+                ce_reg = (uint8_t)(16 + even_idx);
+                co_reg = (uint8_t)(16 + odd_idx);
+            }
+            else
+            {
+                emit_mov_imm64(jb, 0, p->coeff[even_idx]);
+                emit_vpbroadcastq(jb, 30, 0);
+                emit_mov_imm64(jb, 0, p->coeff[odd_idx]);
+                emit_vpbroadcastq(jb, 31, 0);
+            }
+            for(int v = 0; v < 4; v++)
+            {
+                emit_vpmullq(jb, (uint8_t)(8 + v), (uint8_t)(8 + v), (uint8_t)(4 + v), 0);
+                emit_vpmullq(jb, (uint8_t)(12 + v), (uint8_t)(12 + v), (uint8_t)(4 + v), 0);
+                emit_vpaddq(jb, (uint8_t)(8 + v), (uint8_t)(8 + v), ce_reg, 0);
+                emit_vpaddq(jb, (uint8_t)(12 + v), (uint8_t)(12 + v), co_reg, 0);
+            }
+        }
+
+        for(int v = 0; v < 4; v++)
+        {
+            emit_vpmullq(jb, (uint8_t)v, (uint8_t)v, (uint8_t)(12 + v), 0);
+            emit_vpaddq(jb, (uint8_t)v, (uint8_t)v, (uint8_t)(8 + v), 0);
+        }
+    }
+
+    for(int v = 0; v < 4; v++)
+        emit_evex_mem_disp(jb, 0x7F, 2 /*F3*/, 1, (uint8_t)v, v * 64);
+    emit_ret(jb);
+    return 1;
+}
+
+__attribute__((unused))
+static int jit_build_horner(jit_builder *jb, poly_t *p)
+{
+    return jit_build_estrin_avx512(jb, p);
+}
+
+static int jit_build_poly_vex(jit_builder *jb, poly_t *p, int is_avx2)
+{
+    int d = p->degree;
+    if(d < 0 || d > POLY_MAX_DEGREE) return 0;
+
+    uint8_t L = is_avx2 ? 1 : 0;
+    int width = is_avx2 ? 4 : 2;
+    int stride = width * 8;
+
+    for(int v = 0; v < 4; v++)
+        emit_vex_mem_disp(jb, 0x6F, (uint8_t)v, v * stride, L);
+
+    if(d == 0)
+    {
+        emit_mov_imm64(jb, 0, p->coeff[0]);
+        vex_broadcast_rax(jb, 8, L);
+        for(int v = 0; v < 4; v++)
+            emit_vex_mem_disp(jb, 0x7F, 8, v * stride, L);
+        emit_ret(jb);
+        return 1;
+    }
+
+    for(int v = 0; v < 4; v++)
+        vex_vpsrlq(jb, (uint8_t)(8 + v), (uint8_t)v, 32, L);
+
+    emit_mov_imm64(jb, 0, p->coeff[d]);
+    vex_broadcast_rax(jb, 12, L);
+    for(int v = 0; v < 4; v++)
+        vex_vmovdqa_rr(jb, (uint8_t)(4 + v), 12, L);
+
+    for(int i = d - 1; i >= 0; i--)
+    {
+        for(int v = 0; v < 4; v++)
+            vex_mul_vv(jb, (uint8_t)(4 + v), (uint8_t)(4 + v),
+                       (uint8_t)v, (uint8_t)(8 + v), 14, 15, L);
+        if(p->coeff[i] != 0)
+        {
+            emit_mov_imm64(jb, 0, p->coeff[i]);
+            emit_vex_2(jb, 1, 0x6E, 12, 0 /*RAX*/, 0 /*L=0*/, 1 /*W*/, 1);
+            if(L)
+                emit_vex_2(jb, 2, 0x59, 12, 12, 1, 0, 1);
+            else
+                emit_vex_3(jb, 1, 0x6C, 12, 12, 12, 0, 0, 1);
+            for(int v = 0; v < 4; v++)
+                vex_vpaddq(jb, (uint8_t)(4 + v), (uint8_t)(4 + v), 12, L);
+        }
+    }
+
+    for(int v = 0; v < 4; v++)
+        emit_vex_mem_disp(jb, 0x7F, (uint8_t)(4 + v), v * stride, L);
+    emit_ret(jb);
+    return 1;
+}
+
+typedef struct {
+    uint64_t hash;
+    void *code_start;
+    uint32_t len;
+    uint32_t exec_count;
+    uint8_t compiled_ops[MAX_TRACE_LEN];
+    double compiled_consts[MAX_TRACE_LEN];
+    jit_mem  code;
+    int      code_valid;
+    jit_fn_t fn;
+    int      width;
+} trace_node;
+
+static trace_node trace_cache[TRACE_CACHE_SIZE];
+static uint32_t trace_count = 0;
+
